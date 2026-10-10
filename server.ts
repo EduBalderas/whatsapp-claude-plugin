@@ -27,6 +27,7 @@ import makeWASocket, {
   jidNormalizedUser,
   isLidUser,
   normalizeMessageContent,
+  type GroupMetadata,
   type WASocket,
   type WAMessage,
   type WAMessageKey,
@@ -58,11 +59,12 @@ import {
 import { homedir } from "os";
 import { join, extname, sep, basename, resolve } from "path";
 import {
-  expandAllMention,
   isReservedAllToken,
+  mentionContent,
+  mentionsInChat,
   normalizeMentionJids,
-  mentionsForChunk,
 } from "./lib/mentions";
+import { caseSafeKeys } from "./lib/auth-keys";
 import { cronMatches, parseCronSection } from "./lib/cron";
 import { extractMentions, extractText } from "./lib/inbound-message";
 import { parseMaxStore } from "./lib/max-store";
@@ -2687,12 +2689,12 @@ function pruneStrangerCaches(): void {
       lidKeep.add(contactKey(p.senderId));
       lidKeep.add(contactKey(p.chatId));
     }
-    // dmActivity is only half a reprieve when contact caching is off: nothing
-    // persists it (saveDmActivity returns early) and nothing ages it
-    // (pruneStrangers is skipped above), so it is whatever this process
-    // happened to see since boot. Reading it anyway would make the same tick
-    // keep or drop the same mapping depending on process uptime. With caching
-    // off the owner-named half is the whole rule.
+    // dmActivity and contactsMap are only half a reprieve when contact caching
+    // is off: nothing persists them (their savers return early) and nothing
+    // ages them (pruneStrangers is skipped above), so they are whatever this
+    // process happened to see since boot. Reading them anyway would make the
+    // same tick keep or drop the same mapping depending on process uptime.
+    // With caching off the owner-named half is the whole rule.
     if (allowed.size > 0 && pruneLidMap(lidKeep, CACHE_CONTACTS)) saveLidMap();
   } catch (err) {
     logDiag(`${LOG_PREFIX}: stranger-cache prune failed: ${err}\n`);
@@ -2701,9 +2703,12 @@ function pruneStrangerCaches(): void {
 
 /** lid-map.json is the third stranger cache and the only one that grew
  *  forever. Same rule pruneStrangers applies to a contact: keep it if the
- *  owner named this person, or if they are still inside the stranger TTL
- *  (dmActivity has already been aged by the call above, so anything left in
- *  it is recent).
+ *  owner named this person, or if pruneStrangers still keeps them (90 days
+ *  for a DM, 30 days after a group member was last seen; dmActivity and
+ *  contactsMap have already been aged by the call above, so anything left
+ *  in either is recent, saved or allowlisted). The contactsMap
+ *  half is what keeps a group member's mapping: they never get a dmActivity
+ *  row, so without it every one was dropped on each tick.
  *
  *  One lookup covers both directions of the mapping: contactKey(lid) resolves
  *  through lidMap and lands on exactly contactKey(pn), so an allowlist that
@@ -2723,6 +2728,7 @@ function pruneLidMap(
     const key = contactKey(pn);
     if (allowed.has(key)) continue;
     if (useActivity && Object.hasOwn(dmActivity, key)) continue;
+    if (useActivity && Object.hasOwn(contactsMap, key)) continue;
     delete lidMap[lid];
     changed = true;
   }
@@ -3365,7 +3371,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
                   type: "array",
                   items: { type: "string" },
                   description:
-                    'People to @-tag. Prefer a saved contact\'s name where you know it, e.g. ["Akash"] — a raw number or id never needs to appear anywhere in your own text or reasoning. Falls back to the user_id/lid from an inbound <channel> block (a phone number or full JID also works) for someone with no saved name yet. In a group where roster access is granted, use the single value "all" to tag every current member — this expands server-side from live group membership, so it works even for members with no saved contact name and no matter how many there are. You MUST also write the matching "@<value>" into text, using the exact same value you pass here (the name, or "all", if that\'s what you passed); the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing. A name matching more than one saved contact fails the call rather than guessing — use the id for that person instead.',
+                    'People to @-tag. Prefer a saved contact\'s name where you know it, e.g. ["Akash"] — a raw number or id never needs to appear anywhere in your own text or reasoning. Falls back to the user_id/lid from an inbound <channel> block (a phone number or full JID also works) for someone with no saved name yet. In a group where roster access is granted, use the single value "all" to tag every current member — one "@all" in your text, no names or numbers, however many members there are. You MUST also write the matching "@<value>" into text, using the exact same value you pass here (the name, or "all", if that\'s what you passed); the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing. Readers see each tag as the name they saved for that person, never the value you typed. A name matching more than one saved contact fails the call rather than guessing — use the id for that person instead.',
                 },
                 files: {
                   type: "array",
@@ -3679,13 +3685,16 @@ const handleToolCall = async (
             .map((m) => m.id),
         );
 
-        const mentionJids = normalizeMentionJids(
+        let mentionJids = normalizeMentionJids(
           rawMentions.filter((m) => !isAllToken(m)),
           lidMap,
           jidNormalizedUser,
           contactsMap,
         );
-        if (rawMentions.some(isAllToken)) {
+        const tagAll = rawMentions.some(isAllToken);
+        let roster: GroupMetadata | undefined;
+        let allByList: string[] | undefined;
+        if (tagAll) {
           if (!chat_id.endsWith("@g.us")) {
             throw new Error('"all" is only valid for a group chat\'s mentions');
           }
@@ -3694,13 +3703,52 @@ const handleToolCall = async (
               `"all" needs roster access for this group — run ${WIZARD_CMD} (or "group add --roster") to grant it`,
             );
           }
-          const roster = await sock.groupMetadata(chat_id);
-          mentionJids.push(
-            ...expandAllMention(
-              roster.participants.map((p) => p.id),
+          // WhatsApp's own rule (Aug 2026): past 32 members only an admin's
+          // @all tags anyone; from a non-admin it arrives as plain text.
+          // There (and when the roster cannot tell us) every member is
+          // listed instead, as 0.26.2 did for every group.
+          roster = await sock.groupMetadata(chat_id);
+          if (roster.participants.length > 32) {
+            // Only the linked-device user has a lid; Cloud API never gets
+            // here (mentions are refused for it above).
+            const self = sock.user;
+            const mine = [
+              self?.id,
+              self && "lid" in self ? self.lid : undefined,
+            ].flatMap((j) => (j ? [jidNormalizedUser(j)] : []));
+            const me = roster.participants.find((p) =>
+              [p.id, p.phoneNumber].some(
+                (j) => j && mine.includes(jidNormalizedUser(j)),
+              ),
+            );
+            if (!me?.admin) {
+              allByList = roster.participants.map((p) =>
+                jidNormalizedUser(p.id),
+              );
+            }
+          }
+        }
+        // A name is swapped for an id in the visible text only for a member
+        // of this group (see mentionContent). The list is used here and
+        // nowhere else: it never reaches the model without the roster flag.
+        // No list = no swap, so a failed or slow fetch sends the text as typed.
+        if (chat_id.endsWith("@g.us") && mentionJids.length) {
+          try {
+            roster ??= await withTimeout(
+              sock.groupMetadata(chat_id),
+              GROUP_NAME_QUERY_TIMEOUT_MS,
+              "group member list",
+            );
+            mentionJids = mentionsInChat(
+              mentionJids,
+              roster.participants,
               jidNormalizedUser,
-            ),
-          );
+            );
+          } catch (err) {
+            logDiag(
+              `${LOG_PREFIX}: member list unavailable, tags sent as typed: ${err}\n`,
+            );
+          }
         }
 
         for (const f of files) {
@@ -3749,14 +3797,24 @@ const handleToolCall = async (
           // itself has no caption to carry mentions), so attach every requested
           // mention here even when its "@id" text landed beyond the 200-char
           // cut — the notification comes from the mentions array, not the text.
-          const previewMentions = mentionJids.length
-            ? [...new Set(mentionJids.map((m) => m.jid))]
+          // "all" keeps the explicit member list here, as before this path
+          // learned the everyone-tag: that tag needs a literal "@all" in the
+          // text (see mentionContent), and this text is a 200-char cut.
+          const previewJids = [
+            ...mentionJids.map((m) => m.jid),
+            ...(tagAll && roster
+              ? roster.participants.map((p) => jidNormalizedUser(p.id))
+              : []),
+          ];
+          const previewMentions = previewJids.length
+            ? [...new Set(previewJids)]
             : undefined;
           const sent = await sock.sendMessage(
             chat_id,
-            previewMentions
-              ? { text: preview, mentions: previewMentions }
-              : { text: preview },
+            {
+              ...mentionContent(preview, mentionJids, tagAll, allByList),
+              ...(previewMentions && { mentions: previewMentions }),
+            },
             opts ?? undefined,
           );
           if (sent?.key) {
@@ -3789,12 +3847,9 @@ const handleToolCall = async (
             const opts =
               shouldQuote && quotedMsg ? { quoted: quotedMsg } : undefined;
             const formatted = markdownToWhatsApp(chunks[i]);
-            const chunkMentions = mentionsForChunk(formatted, mentionJids);
             const sent = await sock.sendMessage(
               chat_id,
-              chunkMentions
-                ? { text: formatted, mentions: chunkMentions }
-                : { text: formatted },
+              mentionContent(formatted, mentionJids, tagAll, allByList),
               opts ?? undefined,
             );
             if (sent?.key) {
@@ -5457,6 +5512,7 @@ async function connectCloudApi(): Promise<void> {
 async function connectWhatsApp(): Promise<void> {
   if (PROVIDER === "cloud-api") return connectCloudApi();
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  state.keys = caseSafeKeys(state.keys);
   const needsPairing = !state.creds.registered;
   const version = await resolveWaWebVersion();
   const myGeneration = ++pairingGeneration;
