@@ -52,6 +52,7 @@ import {
   type GroupMeta,
 } from "./ranking";
 import { wizardCmd } from "./wizard-cmd";
+import { channelProvider, stateEnvironment } from "../lib/provider";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -94,6 +95,9 @@ type Access = {
   allowFrom: string[];
   groups: Record<string, GroupPolicy>;
   pending: Record<string, PendingEntry>;
+  // true only when `set owner` stored the owner. Linked-device mode stamps
+  // allowFrom[0] on its own, so Cloud API trusts an owner only with this flag.
+  ownerExplicit?: boolean;
   [key: string]: unknown;
 };
 
@@ -262,6 +266,14 @@ function loadLidMap(): Record<string, string> {
 
 function status(): void {
   const a = load();
+  // Status must still render on a typo'd WHATSAPP_PROVIDER; provider.ts
+  // status is the screen that names the typo and `set` is the way out.
+  let cloud = false;
+  try {
+    cloud =
+      channelProvider(stateEnvironment(join(STATE_DIR, ".env"))) ===
+      "cloud-api";
+  } catch {}
   const meta = loadGroupsMeta();
   const now = Date.now();
   // owner is printed with what it MEANS, not as a bare field: it is the one
@@ -279,16 +291,28 @@ function status(): void {
   const ownerAllowed =
     owner.includes("@") &&
     a.allowFrom.some((j) => contactKeyFor(lidMap, j) === ownerKey);
-  const ownerNote = !owner
-    ? "  (unstamped — falling back to allowFrom[0])"
-    : ownerAllowed
-      ? ""
-      : "  (NO LONGER ALLOWLISTED — requests go to your own chat until you set a new one)";
+  const cloudOwnerAllowed =
+    ownerAllowed &&
+    /^\d{5,20}@s\.whatsapp\.net$/.test(owner) &&
+    a.ownerExplicit === true;
+  const ownerNote = cloud
+    ? cloudOwnerAllowed
+      ? "  (confirm this is a personal number, different from the business number)"
+      : ownerAllowed && a.ownerExplicit !== true
+        ? "  (NO VALID CLOUD OWNER — inherited from linked-device mode; re-set it with /whatsapp-channel:access set owner <jid>)"
+        : "  (NO VALID CLOUD OWNER — requests are not sent; set an allowlisted personal phone JID)"
+    : !owner
+      ? "  (unstamped — falling back to allowFrom[0])"
+      : ownerAllowed
+        ? ""
+        : "  (NO LONGER ALLOWLISTED — requests go to your own chat until you set a new one)";
   const lines = [
     `state dir:  ${STATE_DIR}`,
     `dmPolicy:   ${a.dmPolicy}`,
-    `owner:      ${owner || a.allowFrom[0] || "(none)"}${ownerNote}`,
-    `            permission requests go here; change with "set owner <jid>"`,
+    `owner:      ${owner || (!cloud && a.allowFrom[0]) || "(none)"}${ownerNote}`,
+    cloud
+      ? '            Cloud has no fallback owner; runtime status verifies the recipient. Change with "set owner <jid>"'
+      : `            permission requests go here; change with "set owner <jid>"`,
     `allowFrom:  ${a.allowFrom.length} contact(s)`,
     ...a.allowFrom.map(
       (jid) =>
@@ -1113,6 +1137,9 @@ function set(key: string, rawValue: string): void {
     value = match;
   }
   a[key] = value;
+  // Marks the owner as chosen by the user, not stamped from allowFrom[0] by
+  // linked-device mode; Cloud API accepts an owner only with this flag.
+  if (key === "owner") a.ownerExplicit = true;
   save(a);
   process.stdout.write(`${key} = ${JSON.stringify(value)}\n`);
 }
@@ -1207,6 +1234,21 @@ switch (command) {
       die(`Policy must be one of: ${POLICIES.join(", ")}`);
     }
     const a = load();
+    if (mode === "pairing") {
+      // The server drops every non-allowlisted Cloud DM regardless, so
+      // saying yes here would only mislead: pairing codes are for a personal
+      // number, never for whoever writes to a public business number.
+      let cloud = false;
+      try {
+        cloud =
+          channelProvider(stateEnvironment(join(STATE_DIR, ".env"))) ===
+          "cloud-api";
+      } catch {}
+      if (cloud)
+        die(
+          "Pairing is unavailable with the Cloud API provider; allowlist contacts with `allow <jid>` instead",
+        );
+    }
     a.dmPolicy = mode;
     save(a);
     process.stdout.write(`dmPolicy = ${mode}\n`);

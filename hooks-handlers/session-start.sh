@@ -11,6 +11,13 @@ ACCESS_FILE="${STATE_DIR}/access.json"
 # regardless of where the hook was launched from.
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Provider-specific onboarding never exposes credentials to model context.
+provider_json="$(bun "${PLUGIN_ROOT}/scripts/provider-onboarding.ts" 2>/dev/null)"
+if [[ -n ${provider_json} ]]; then
+	echo "${provider_json}"
+	exit 0
+fi
+
 # Check setup state
 has_phone=false
 has_auth=false
@@ -41,10 +48,22 @@ if [[ -f ${ACCESS_FILE} ]] && json_has "${ACCESS_FILE}" '"allowFrom":\[".'; then
 fi
 
 # Build context message based on state
+# Reaching here means provider-onboarding.ts resolved linked-device mode. It
+# sees plugin /config values too: Claude Code exports each userConfig option
+# to hook processes as CLAUDE_PLUGIN_OPTION_<KEY>. NO DOUBLE QUOTES in
+# provider_scope - it prefixes every branch below and is interpolated raw
+# into the heredoc's JSON. The mismatch sentence only ever inserts fixed text.
+provider_scope="Effective connection: linked device (Baileys, the default). "
+# `|| true`: a missing .env is the normal first-run state, not an error.
+saved_provider="$(sed -n 's/^WHATSAPP_PROVIDER=//p' "${ENV_FILE}" 2>/dev/null | tail -n 1 | tr -d "\"'[:space:]" || true)"
+plugin_provider="$(tr -d '[:space:]' <<<"${CLAUDE_PLUGIN_OPTION_CONNECTION_PROVIDER-}")"
+if [[ ${saved_provider} == baileys && ${plugin_provider} == cloud-api ]]; then
+	provider_scope+="The terminal-saved provider baileys is in effect; the plugin setting cloud-api is ignored. "
+fi
 if [ "$has_phone" = false ]; then
-	msg="WhatsApp plugin installed but not configured yet. Guide the user through setup:\n\n1. Run: /whatsapp-channel:configure <phone> (country code + number, no +, e.g. 886912345678)\n2. Exit and launch: claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin\n3. The pairing code appears automatically — enter it on phone: WhatsApp > Linked Devices > Link with phone number instead\n\nPrompt the user to provide their WhatsApp phone number to get started."
+	msg="${provider_scope}WhatsApp plugin installed but not configured yet. Run /whatsapp-channel:setup to choose linked device (Baileys, the existing default) or official WhatsApp Cloud API. Linked device uses a phone pairing code or QR; Cloud API requires Meta business configuration and a public HTTPS webhook. Credentials must be entered in the user’s own terminal, never in chat. Existing linked-device installs keep their current provider."
 elif [ "$has_auth" = false ]; then
-	msg="WhatsApp phone number is configured but device is not paired yet.\n\nThe user needs to:\n1. Exit and launch: claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin\n2. The pairing code appears automatically in the session\n3. Enter it on phone: WhatsApp > Linked Devices > Link with phone number instead"
+	msg="${provider_scope}WhatsApp phone number is configured but device is not paired yet.\n\nThe user needs to:\n1. Exit and launch: claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin\n2. The pairing code appears automatically in the session\n3. Enter it on phone: WhatsApp > Linked Devices > Link with phone number instead"
 elif [ "$has_contacts" = false ]; then
 	# The access screen is the normal route; pairing stays because it
 	# is the only route for someone who has never messaged this account.
@@ -53,7 +72,7 @@ elif [ "$has_contacts" = false ]; then
 	# JSON string. That is also why the absolute `bun "<path>" wizard` form
 	# lives in scripts/access.ts, where JSON.stringify escapes it, and this
 	# branch names the skill instead.
-	msg="WhatsApp is paired but no contacts are allowlisted yet. The owner JID is auto-added on connection.\n\nThe normal way to add the rest is the access screen - it opens in a new terminal window, lists the contacts and groups the user already talks to with anything already reachable pre-ticked, and applies the lot in one pass:\n\n1. Run: /whatsapp-channel:access review\n2. Tick contacts and groups there, then Apply. Only the +/- list comes back to this session.\n\nIf that window cannot be opened from here (a headless or remote session), the command prints itself - run it in a real terminal.\n\nFor someone who has never messaged this account, pairing is still the route:\n1. Run: /whatsapp-channel:access policy pairing\n2. Have them DM the linked number\n3. Run: /whatsapp-channel:access pair <code>\n4. Policy auto-locks back to allowlist after pairing"
+	msg="${provider_scope}WhatsApp is paired but no contacts are allowlisted yet. The owner JID is auto-added on connection.\n\nThe normal way to add the rest is the access screen - it opens in a new terminal window, lists the contacts and groups the user already talks to with anything already reachable pre-ticked, and applies the lot in one pass:\n\n1. Run: /whatsapp-channel:access review\n2. Tick contacts and groups there, then Apply. Only the +/- list comes back to this session.\n\nIf that window cannot be opened from here (a headless or remote session), the command prints itself - run it in a real terminal.\n\nFor someone who has never messaged this account, pairing is still the route:\n1. Run: /whatsapp-channel:access policy pairing\n2. Have them DM the linked number\n3. Run: /whatsapp-channel:access pair <code>\n4. Policy auto-locks back to allowlist after pairing"
 else
 	# Fully configured: check for a one-time "what's new" notice first. It
 	# prints its own complete, already-valid JSON (built with
@@ -67,7 +86,7 @@ else
 	# JSON.stringify in update-notice.ts, which would escape the backslash
 	# again and ship a literal \n to the model. Plain prose reads identically
 	# down both paths.
-	msg="WhatsApp channel is fully configured and ready. Paired contacts can message this session."
+	msg="${provider_scope}WhatsApp channel is fully configured and ready. Paired contacts can message this session."
 	# Passed in because the notice REPLACES this handler's output: the script
 	# carries this same message through on its own hookSpecificOutput, so a
 	# session that gets a notice still briefs the model identically to one
