@@ -53,14 +53,16 @@ WHATSAPP_CLOUD_VERIFY_TOKEN=<PRIVATE_RANDOM_VERIFY_TOKEN>
 The phone number ID is Meta's resource ID, not your phone number or WABA ID.
 Use a suitable token with `whatsapp_business_messaging`; managing/subscribing the
 WABA also needs `whatsapp_business_management`. Plugin user configuration can
-provide the same values. A nonempty process/plugin value takes precedence over
-the saved file; empty or unresolved plugin fields fall back to saved values.
+provide the same values. A non-empty value saved in `~/.whatsapp-channel/.env`
+by the terminal tools takes precedence over plugin `/config` userConfig for that
+key; plugin values only fill keys the file does not set. To return a key to
+plugin management, remove it from `.env`.
 Restart every server using that state directory after configuration changes.
 
-Plugin settings are passed to the MCP subprocess, not the SessionStart hook.
-If you configure only plugin settings, check the effective provider with the MCP
-`status` tool and skip any linked-device setup guidance. Terminal configuration
-lets both the hook and MCP server see the selected provider.
+Plugin settings reach both the MCP subprocess (as environment variables) and
+the SessionStart hook (as `CLAUDE_PLUGIN_OPTION_*`), so the hook reports the
+same effective provider the server runs. When the terminal-saved `.env` and the
+plugin setting disagree, the hook says which one is in effect.
 
 Optional settings:
 
@@ -107,9 +109,17 @@ bun scripts/access.ts set owner <PERSONAL_DIGITS>@s.whatsapp.net
 bun scripts/access.ts policy allowlist
 ```
 
+In Cloud mode the owner must be set explicitly with
+`/whatsapp-channel:access set owner <jid>`; an owner inherited from linked-device
+mode is not used. `dmPolicy` is auto-locked from `pairing` to `allowlist` when the
+Cloud listener starts, so contacts must be allowlisted before they can reach the
+agent.
+
 An inbound user message opens/resets a 24-hour service window. Free-form replies,
 files and reactions need an open window; delivery/status events and scheduled
-tasks do not open one. Outside it, call the explicit `send_template` MCP tool
+tasks do not open one. The plugin does not track the window itself: Meta reports a
+closed window as a failed delivery status, which the plugin logs to `diag.log`.
+Outside it, call the explicit `send_template` MCP tool
 with an approved template's `name`, `language`, recipient `chat_id`, and optional
 `components` array. Parameters must match that approved template. The plugin
 does not automatically turn arbitrary Claude text or cron output into templates.

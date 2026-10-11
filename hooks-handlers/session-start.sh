@@ -48,7 +48,17 @@ if [[ -f ${ACCESS_FILE} ]] && json_has "${ACCESS_FILE}" '"allowFrom":\[".'; then
 fi
 
 # Build context message based on state
-provider_scope="The setup state below applies to linked-device mode only. Plugin userConfig may select Cloud API without exposing that selection to this hook. Check the effective connection with the WhatsApp status tool before following pairing or automatic-owner guidance. If it reports cloud-api, use /whatsapp-channel:configure provider cloud-api and docs/cloud-api.md instead. "
+# Reaching here means provider-onboarding.ts resolved linked-device mode. It
+# sees plugin /config values too: Claude Code exports each userConfig option
+# to hook processes as CLAUDE_PLUGIN_OPTION_<KEY>. NO DOUBLE QUOTES in
+# provider_scope - it prefixes every branch below and is interpolated raw
+# into the heredoc's JSON. The mismatch sentence only ever inserts fixed text.
+provider_scope="Effective connection: linked device (Baileys, the default). "
+saved_provider="$(sed -n 's/^WHATSAPP_PROVIDER=//p' "${ENV_FILE}" 2>/dev/null | tail -n 1 | tr -d "\"'[:space:]")"
+plugin_provider="$(tr -d '[:space:]' <<<"${CLAUDE_PLUGIN_OPTION_CONNECTION_PROVIDER-}")"
+if [[ ${saved_provider} == baileys && ${plugin_provider} == cloud-api ]]; then
+	provider_scope+="The terminal-saved provider baileys is in effect; the plugin setting cloud-api is ignored. "
+fi
 if [ "$has_phone" = false ]; then
 	msg="${provider_scope}WhatsApp plugin installed but not configured yet. Run /whatsapp-channel:setup to choose linked device (Baileys, the existing default) or official WhatsApp Cloud API. Linked device uses a phone pairing code or QR; Cloud API requires Meta business configuration and a public HTTPS webhook. Credentials must be entered in the user’s own terminal, never in chat. Existing linked-device installs keep their current provider."
 elif [ "$has_auth" = false ]; then

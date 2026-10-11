@@ -7,6 +7,10 @@ export function configuredValue(value: string | undefined): string | undefined {
   return trimmed && !trimmed.startsWith("${") ? trimmed : undefined;
 }
 
+export function isProviderKey(key: string): boolean {
+  return key === "WHATSAPP_PROVIDER" || key.startsWith("WHATSAPP_CLOUD_");
+}
+
 export function channelProvider(
   env: Record<string, string | undefined>,
 ): ChannelProvider {
@@ -32,10 +36,22 @@ export function stateEnvironment(
   try {
     saved = parseStateEnv(readFileSync(path, "utf8"));
   } catch {}
-  const result = { ...saved, ...env };
-  // Empty plugin userConfig fields must not mask terminal-saved configuration.
-  for (const key of Object.keys(saved)) {
-    if (!configuredValue(env[key])) result[key] = saved[key];
+  // For the provider keys, a non-empty value saved in the state .env wins;
+  // the process/plugin env only fills keys the file lacks or leaves blank
+  // (blank or an unexpanded `${...}` placeholder counts as unset on both
+  // sides). Every terminal tool (provider, status, doctor, access) and the
+  // SessionStart hook read this file, so it must be what the server runs -
+  // otherwise `provider.ts set` reports one connection while a plugin
+  // /config value starts another. Every other key keeps "real env wins",
+  // the same split server.ts's own .env loader applies.
+  const result: Record<string, string | undefined> = { ...env };
+  for (const [key, value] of Object.entries(saved)) {
+    if (
+      env[key] === undefined ||
+      (isProviderKey(key) &&
+        (configuredValue(value) || !configuredValue(env[key])))
+    )
+      result[key] = value;
   }
   return result;
 }

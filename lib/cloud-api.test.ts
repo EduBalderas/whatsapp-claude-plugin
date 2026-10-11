@@ -6,6 +6,7 @@ import {
   readCloudApiConfig,
   type CloudApiConfig,
   type CloudReaction,
+  type CloudStatus,
 } from "./cloud-api";
 
 const config: CloudApiConfig = {
@@ -76,6 +77,7 @@ async function start(
     onMessage?: (message: WAMessage) => Promise<void>;
     onReaction?: (reaction: CloudReaction) => Promise<void>;
     onError?: (safeMessage: string) => void;
+    onStatus?: (status: CloudStatus) => void | Promise<void>;
     maxMediaEntries?: number;
   } = {},
 ) {
@@ -89,6 +91,7 @@ async function start(
       }),
     onReaction: options.onReaction,
     onError: options.onError,
+    onStatus: options.onStatus,
     maxMediaEntries: options.maxMediaEntries,
   });
   active.push(socket);
@@ -296,6 +299,118 @@ describe("Cloud API webhook trust boundary", () => {
     expect(received).toHaveLength(0);
   });
 
+  test("failed send statuses reach onStatus with recipient and error code", async () => {
+    const statuses: CloudStatus[] = [];
+    const { post, received } = await start({
+      onStatus: (status) => {
+        statuses.push(status);
+      },
+    });
+    const statusEnvelope = (phoneNumberId: string) => ({
+      object: "whatsapp_business_account",
+      entry: [
+        {
+          changes: [
+            {
+              field: "messages",
+              value: {
+                messaging_product: "whatsapp",
+                metadata: { phone_number_id: phoneNumberId },
+                statuses: [
+                  {
+                    id: "wamid.sent-1",
+                    status: "failed",
+                    timestamp: "1791561600",
+                    recipient_id: "886900000001",
+                    errors: [
+                      {
+                        code: 131047,
+                        title: "Re-engagement message",
+                        message: "More than 24 hours have passed",
+                      },
+                      { code: "bad", title: "ignored" },
+                    ],
+                  },
+                  { id: "no-recipient", status: "failed" },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+    expect((await post(statusEnvelope("999999"))).status).toBe(200);
+    expect((await post(statusEnvelope(config.phoneNumberId))).status).toBe(200);
+    await until(() => statuses.length === 1);
+    expect(statuses).toEqual([
+      {
+        id: "wamid.sent-1",
+        recipient: jid,
+        status: "failed",
+        errors: [{ code: 131047, title: "Re-engagement message" }],
+      },
+    ]);
+    expect(received).toHaveLength(0);
+  });
+
+  test("template button and interactive replies become text messages", async () => {
+    const { post, received } = await start();
+    await post(
+      envelope([
+        fixtureMessage("button-reply", {
+          type: "button",
+          button: { text: "Confirm", payload: "confirm" },
+          context: { id: "template-message", from: "886900000099" },
+        }),
+        fixtureMessage("interactive-reply", {
+          type: "interactive",
+          interactive: {
+            type: "button_reply",
+            button_reply: { id: "opt-1", title: "Option one" },
+          },
+        }),
+        fixtureMessage("list-reply", {
+          type: "interactive",
+          interactive: {
+            type: "list_reply",
+            list_reply: { id: "row-1", title: "Row one" },
+          },
+        }),
+      ]),
+    );
+    await until(() => received.length === 3);
+    expect(received[0].message?.extendedTextMessage?.text).toBe("Confirm");
+    expect(
+      received[0].message?.extendedTextMessage?.contextInfo?.stanzaId,
+    ).toBe("template-message");
+    expect(received[1].message?.extendedTextMessage?.text).toBe("Option one");
+    expect(received[2].message?.extendedTextMessage?.text).toBe("Row one");
+  });
+
+  test("unsupported inbound types are reported without sender or content and still acknowledged", async () => {
+    const errors: string[] = [];
+    const { post, received } = await start({
+      onError: (message) => {
+        errors.push(message);
+      },
+    });
+    const response = await post(
+      envelope([
+        fixtureMessage("location", {
+          type: "location",
+          location: { latitude: 25.03, longitude: 121.56, name: "private" },
+        }),
+      ]),
+    );
+    expect(response.status).toBe(200);
+    expect(errors).toEqual([
+      "Cloud API dropped unsupported inbound type location",
+    ]);
+    expect(errors.join()).not.toContain("886900000001");
+    expect(errors.join()).not.toContain("private");
+    expect(received).toHaveLength(0);
+  });
+
   test("callback queue is serial, acknowledges promptly, and rejects overflow without marking it seen", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -304,7 +419,11 @@ describe("Cloud API webhook trust boundary", () => {
     const delivered: string[] = [];
     let running = 0;
     let maxRunning = 0;
+    const errors: string[] = [];
     const { post } = await start({
+      onError: (message) => {
+        errors.push(message);
+      },
       onMessage: async (message) => {
         running++;
         maxRunning = Math.max(maxRunning, running);
@@ -324,6 +443,9 @@ describe("Cloud API webhook trust boundary", () => {
       expect((await post(envelope([fixtureMessage("overflow")]))).status).toBe(
         503,
       );
+      expect(errors).toEqual([
+        "Cloud API webhook queue full; 1 message(s) rejected with 503",
+      ]);
       release();
       await until(() => delivered.length === 1000);
       expect((await post(envelope([fixtureMessage("overflow")]))).status).toBe(

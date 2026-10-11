@@ -54,7 +54,11 @@ printed pairing code in WhatsApp → Settings → Linked Devices → Link a Devi
 For official business DMs, follow [Cloud API setup](./docs/cloud-api.md). This
 provider does not yet support groups, message editing, phone history/address-book
 import or coexistence synchronization. Add an explicitly allowed personal owner;
-the business number is never auto-added. Configuration readiness is not proof
+the business number is never auto-added, and the owner must be set explicitly with
+`/whatsapp-channel:access set owner <jid>`. A non-empty key saved in
+`~/.whatsapp-channel/.env` by the terminal tools wins over plugin `/config` values
+for that key; remove it from `.env` to return it to plugin management.
+Configuration readiness is not proof
 that the public webhook works. Rates vary; consult
 [Meta pricing](https://business.whatsapp.com/products/platform-pricing) and
 [FAQ](https://whatsappbusiness.com/resources/faq/).

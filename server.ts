@@ -34,7 +34,11 @@ import makeWASocket, {
   type proto,
 } from "@whiskeysockets/baileys";
 import { CloudApiSocket, readCloudApiConfig, type Json } from "./lib/cloud-api";
-import { channelProvider, configuredValue } from "./lib/provider";
+import {
+  channelProvider,
+  configuredValue,
+  isProviderKey,
+} from "./lib/provider";
 import { randomBytes, timingSafeEqual } from "crypto";
 import { execFile, execFileSync } from "child_process";
 import { promisify } from "util";
@@ -161,7 +165,13 @@ const ROLE_FILE = join(STATE_DIR, `.role-${process.pid}`);
 // startup, so this only needs computing once.
 const IPC_SOCKET_PATH = ipcSocketPath(resolve(STATE_DIR));
 
-// Load ~/.whatsapp-channel/.env into process.env. Real env wins.
+// Load ~/.whatsapp-channel/.env into process.env. Real env wins — EXCEPT for
+// the provider keys, where a non-empty value in the file wins over the plugin
+// userConfig that .mcp.json forwards. Same rule as lib/provider.ts's
+// stateEnvironment: every terminal tool (provider.ts set/status, doctor,
+// access status) and the session hook read the file, so the file must be
+// what this process actually runs, or `set baileys` prints "Saved" while
+// the server keeps starting Cloud.
 try {
   chmodSync(ENV_FILE, 0o600);
 } catch {}
@@ -171,15 +181,14 @@ try {
   const envText = envRaw.charCodeAt(0) === 0xfeff ? envRaw.slice(1) : envRaw;
   for (const line of envText.split(/\r?\n/)) {
     const m = line.match(/^(\w+)=(.*)$/);
+    if (!m) continue;
+    const fileValue = m[2].replace(/\r$/, "").replace(/^(['"])(.*)\1$/, "$2");
     if (
-      m &&
-      (process.env[m[1]] === undefined ||
-        ((m[1] === "WHATSAPP_PROVIDER" || m[1].startsWith("WHATSAPP_CLOUD_")) &&
-          !configuredValue(process.env[m[1]])))
+      process.env[m[1]] === undefined ||
+      (isProviderKey(m[1]) &&
+        (configuredValue(fileValue) || !configuredValue(process.env[m[1]])))
     ) {
-      process.env[m[1]] = m[2]
-        .replace(/\r$/, "")
-        .replace(/^(['"])(.*)\1$/, "$2");
+      process.env[m[1]] = fileValue;
     }
   }
 } catch {}
@@ -1201,6 +1210,11 @@ type Access = {
   // Optional only so an access.json written before this field existed still
   // parses; the first connect fills it in.
   owner?: string;
+  // Written only by `access set owner`. Cloud mode trusts no other owner:
+  // the Baileys open block stamps allowFrom[0] (lib/owner.ts), and a
+  // Cloud → Baileys → Cloud round-trip would otherwise promote the first
+  // customer to approver.
+  ownerExplicit?: boolean;
   groups: Record<string, GroupPolicy>;
   pending: Record<string, PendingEntry>;
   mentionPatterns?: string[];
@@ -1272,6 +1286,10 @@ function readAccessFile(): Access {
       dmPolicy: parsed.dmPolicy ?? "pairing",
       allowFrom: parsed.allowFrom ?? [],
       owner: parsed.owner,
+      // Copied through explicitly like every other field: saveAccess writes
+      // this object back, so a key not listed here is silently dropped from
+      // access.json on the next save (the cloud auto-lock, ownerStamp...).
+      ownerExplicit: parsed.ownerExplicit === true ? true : undefined,
       groups: parsed.groups ?? {},
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
@@ -1944,6 +1962,10 @@ function gate(
     if (isAllowedJid(senderJid, access.allowFrom))
       return { action: "deliver", access };
     if (access.dmPolicy === "allowlist") return { action: "drop" };
+    // Cloud: the business number is public, so pairing is never offered to
+    // whoever writes in - connect auto-locks the policy, and this covers a
+    // `policy pairing` flipped by hand between connects.
+    if (PROVIDER === "cloud-api") return { action: "drop" };
 
     // pairing mode. A backlog message (offline replay) never gets a pairing
     // reply, so it must not mint or refresh a code either: that would fill the
@@ -3046,6 +3068,7 @@ function permissionTarget(access: Access): string | undefined {
   // still-allowlisted owner; never select the first customer or self-chat.
   if (PROVIDER === "cloud-api") {
     return stored &&
+      access.ownerExplicit === true &&
       /^\d{5,20}@s\.whatsapp\.net$/.test(stored) &&
       isAllowedJid(stored, access.allowFrom) &&
       (!ownJid || !isAllowedJid(stored, [ownJid]))
@@ -3594,6 +3617,13 @@ const handleToolCall = async (
           })
           .parse(args);
         assertAllowedChat(template.chat_id);
+        // Snapshot before the await, same as `reply`: a customer message
+        // landing while the Graph POST is in flight is not answered by it.
+        const templateRepliedIds = new Set(
+          getUnreplied()
+            .filter((m) => m.chat_id === template.chat_id)
+            .map((m) => m.id),
+        );
         const sent = await sock.sendTemplate(template.chat_id, {
           name: template.name,
           language: template.language,
@@ -3610,6 +3640,9 @@ const handleToolCall = async (
           replied: true,
           direction: "out",
         });
+        // A template IS the answer to an expired-window customer; without
+        // this the chat stays in unreplied/catch_up like `reply` would not.
+        markReplied(template.chat_id, templateRepliedIds);
         return {
           content: [
             {
@@ -4716,14 +4749,7 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
 
   // Idempotence: an id already in the log is a replay (second line behind
   // wasSentByServer), or markReplied would flip this chat's unreplied to replied.
-  try {
-    if (
-      msg.key.id &&
-      existsSync(MESSAGE_LOG) &&
-      logContainsId(readFileSync(MESSAGE_LOG, "utf8"), msg.key.id)
-    )
-      return;
-  } catch {}
+  if (msg.key.id && messageAlreadyLogged(msg.key.id)) return;
 
   const tsSec = Number(msg.messageTimestamp ?? 0);
   // BEFORE the await, which is what markReplied's no-snapshot call relies
@@ -5197,6 +5223,20 @@ function scheduleReconnect(delay: number): void {
   }, delay);
 }
 
+// Whole-file scan on every call, like the hand-reply path that used to inline
+// it: the log is pruned to WHATSAPP_MESSAGE_TTL_DAYS, and the callers are
+// per-inbound-message, not per-tick.
+function messageAlreadyLogged(id: string): boolean {
+  try {
+    return (
+      existsSync(MESSAGE_LOG) &&
+      logContainsId(readFileSync(MESSAGE_LOG, "utf8"), id)
+    );
+  } catch {
+    return false;
+  }
+}
+
 const BACKLOG_SKEW_TOLERANCE_MS = 60_000;
 function isOfflineBacklog(msg: WAMessage): boolean {
   if (!connectedAt) return true;
@@ -5354,12 +5394,46 @@ async function handlePermissionReactions(
 }
 
 async function connectCloudApi(): Promise<void> {
+  // The business number is public. Baileys locks pairing → allowlist only
+  // after it has allowlisted the linked account; Cloud has no linked account
+  // to add, so lock unconditionally before the listener is up — otherwise
+  // every customer who writes gets the pairing-code text and burns the
+  // pending slots. Contacts are added from the terminal (access skill).
+  if (!STATIC) {
+    const access = loadAccess();
+    if (access.dmPolicy === "pairing") {
+      access.dmPolicy = "allowlist";
+      saveAccess(access);
+      logDiag(
+        `${LOG_PREFIX}: cloud-api: dmPolicy pairing → allowlist (pairing codes must never go to customers)\n`,
+      );
+    }
+  }
   const cloud = new CloudApiSocket(readCloudApiConfig(process.env), {
     onMessage: async (message) => {
-      await handleMessage(message);
+      // Meta re-delivers every webhook that never got a 200, for days, and
+      // CloudApiSocket's seen-set dies with the process. Same two rules as
+      // the Baileys upsert: an id already in the log is a replay of a message
+      // this install processed, drop it; anything older than this connect is
+      // the offline pile - recorded, never acted on (no ack, no pairing
+      // reply, no download).
+      if (message.key.id && messageAlreadyLogged(message.key.id)) return;
+      await handleMessage(message, isOfflineBacklog(message));
     },
     onReaction: async (reaction) => {
       await handlePermissionReactions([reaction]);
+    },
+    onStatus: (status) => {
+      // Cloud accepts a send with 200 + id and reports the failure later
+      // (131047: 24h window closed). Without this the reply/template/
+      // permission request looks delivered and nothing reaches diag.log.
+      if (status.status !== "failed") return;
+      const detail =
+        status.errors.map((e) => `${e.code} ${e.title}`).join("; ") ||
+        "no error detail";
+      const line = `Cloud API delivery failed (id ${status.id}, to ${maskJid(status.recipient)}): ${detail}`;
+      logDiag(`${LOG_PREFIX}: ${line}\n`);
+      if (AUTO_NOTIFY) notifySystem(line, "cloud-failed");
     },
     onError: (message) => logDiag(`${LOG_PREFIX}: ${message}\n`),
     maxMediaEntries: MAX_STORE,
@@ -5581,6 +5655,9 @@ async function connectWhatsApp(): Promise<void> {
         const owner = ownerStamp(access.owner, allowFromBefore, resolvedOwn);
         if (owner !== undefined && owner !== access.owner) {
           access.owner = owner;
+          // A stamped owner is never explicit, whatever flag a hand-cleared
+          // owner left behind - otherwise Cloud would later trust it.
+          access.ownerExplicit = undefined;
           accessChanged = true;
         }
         if (accessChanged) {

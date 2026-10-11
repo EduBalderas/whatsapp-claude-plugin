@@ -51,8 +51,8 @@ They can explicitly use `set baileys` or `set cloud-api`. Do not collect Cloud
 credentials through chat or invoke interactive password prompts through a
 captured Bash tool. The command stores configuration privately, preserves
 unrelated configuration and linked-device auth, and requires a restart.
-Nonempty process/plugin configuration overrides saved configuration; empty
-plugin fields fall back to saved values. Do not auto-select Cloud API.
+A non-empty key saved in `.env` by this command wins over plugin `/config`
+values for that key; plugin values only fill keys the file does not set. Do not auto-select Cloud API.
 
 ## Phase 2: Connect
 
@@ -83,16 +83,37 @@ from an approved personal number, then confirm inbound receipt and a reply.
 ## Phase 3: Access control and owner
 
 Use `/whatsapp-channel:access` or its CLI; preserve existing access policy,
-allowlist, groups and pending approvals. Never overwrite `access.json` with a
-new default object during onboarding.
+allowlist, groups and pending approvals. Never overwrite an existing
+`access.json` with a new default object during onboarding.
 
-Linked device automatically adds the connected owner. Its terminal access
-screen (`/whatsapp-channel:access review`) can select existing contacts/groups.
-Pairing is a temporary fallback for unknown JIDs.
+**Linked device.** Explain the access model:
 
-Cloud API does not import the phone's contacts or auto-add the business number.
-Add the owner's **personal** WhatsApp number explicitly, then set that allowed
-JID as owner for permission delivery:
+> "By default, when someone DMs your WhatsApp account, they'll get a pairing code. You approve them by running `/whatsapp-channel:access pair <code>` here. This prevents random people from talking to your Claude session."
+
+Your own number is added automatically. Ask:
+
+> "Would you like to:"
+>
+> 1. **Keep the default** (pairing mode) — recommended for most users
+> 2. **Allowlist only** — silently drop messages from unknown senders (no pairing reply)
+> 3. **Add a specific contact now** — if you already know their WhatsApp user ID
+
+For option 1: No action needed, just confirm.
+For option 2: If `~/.whatsapp-channel/access.json` does not exist, write
+`{"dmPolicy": "allowlist", "allowFrom": [], "groups": {}, "pending": {}}` to it.
+If it exists, change only `dmPolicy` to `"allowlist"` (or run
+`/whatsapp-channel:access policy allowlist`) and keep every other field.
+For option 3: Ask for the numeric user ID (e.g., `886912345678`). They can find
+it by having the contact message @userinfobot on Telegram, or by checking
+WhatsApp linked device logs. Add it to `allowFrom` in `access.json` (or run
+`/whatsapp-channel:access allow <id>`), preserving existing entries.
+
+The terminal access screen (`/whatsapp-channel:access review`) can also select
+existing contacts and groups. Pairing is a temporary fallback for unknown JIDs.
+
+**Cloud API.** There is no phone contact import and the business number is never
+auto-added. Add the owner's **personal** WhatsApp number explicitly, then set
+that allowed JID as owner for permission delivery:
 
 ```text
 /whatsapp-channel:access allow <digits>@s.whatsapp.net

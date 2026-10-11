@@ -248,11 +248,23 @@ function checkProvider(): ChannelProvider | null {
 }
 
 function checkCloudAccess(acc: AccessShape | null): void {
-  if (
-    !acc?.owner ||
-    !/^\d{5,20}@s\.whatsapp\.net$/.test(acc.owner) ||
-    !acc.allowFrom.includes(acc.owner)
-  ) {
+  const allowedOwner =
+    !!acc?.owner &&
+    /^\d{5,20}@s\.whatsapp\.net$/.test(acc.owner) &&
+    acc.allowFrom.includes(acc.owner);
+  // Linked-device mode stamps allowFrom[0] as owner by itself; only an owner
+  // set with `access set owner` carries ownerExplicit.
+  if (allowedOwner && acc?.ownerExplicit !== true) {
+    report(
+      "WARN",
+      "cloud-owner",
+      "the stored owner was inherited from linked-device mode and is not used by Cloud API",
+      {
+        kind: "manual",
+        text: "Re-set it with /whatsapp-channel:access set owner <digits>@s.whatsapp.net",
+      },
+    );
+  } else if (!allowedOwner) {
     report(
       "WARN",
       "cloud-owner",
@@ -396,6 +408,7 @@ const VALID_POLICIES = ["pairing", "allowlist", "disabled"];
 
 type AccessShape = {
   owner?: string;
+  ownerExplicit?: boolean;
   dmPolicy: string;
   allowFrom: unknown[];
   groups: Record<string, unknown>;

@@ -95,6 +95,33 @@ describe("Cloud permission owner status", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  test("an owner stamped by linked-device mode is not a Cloud owner until re-set", () => {
+    const dir = freshStateDir();
+    try {
+      writeFileSync(join(dir, ".env"), "WHATSAPP_PROVIDER=cloud-api\n");
+      writeFileSync(
+        join(dir, "access.json"),
+        JSON.stringify({
+          dmPolicy: "allowlist",
+          allowFrom: ["886900000001@s.whatsapp.net"],
+          owner: "886900000001@s.whatsapp.net",
+          groups: {},
+          pending: {},
+        }),
+      );
+      const inherited = run(dir, "status").out;
+      expect(inherited).toContain("NO VALID CLOUD OWNER");
+      expect(inherited).toContain("inherited from linked-device mode");
+      expect(run(dir, "set", "owner", "886900000001@s.whatsapp.net").code).toBe(
+        0,
+      );
+      const explicit = run(dir, "status").out;
+      expect(explicit).not.toContain("NO VALID CLOUD OWNER");
+      expect(explicit).toContain("different from the business number");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // Stands in for the terminal launcher. Prints the argv it was handed (so the
@@ -402,6 +429,8 @@ describe("owner", () => {
     const ok = run(dir, "set", "owner", "886912345678@s.whatsapp.net");
     expect(ok.code).toBe(0);
     expect(access(dir).owner).toBe("886912345678@s.whatsapp.net");
+    // Only `set owner` marks the owner as user-chosen; Cloud API requires it.
+    expect(access(dir).ownerExplicit).toBe(true);
     const bad = run(dir, "set", "owner", "886912345678");
     expect(bad.code).toBe(1);
     expect(access(dir).owner).toBe("886912345678@s.whatsapp.net"); // unchanged

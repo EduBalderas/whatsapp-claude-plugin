@@ -71,11 +71,19 @@ export interface CloudReaction {
   reaction: { text: string; key: WAMessageKey };
 }
 
+export interface CloudStatus {
+  id: string;
+  recipient: string;
+  status: string;
+  errors: { code: number; title: string }[];
+}
+
 type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
 interface CloudApiOptions {
   onMessage: (message: WAMessage) => Promise<void>;
   onReaction?: (reaction: CloudReaction) => Promise<void>;
   onError?: (safeMessage: string) => void;
+  onStatus?: (status: CloudStatus) => void | Promise<void>;
   fetch?: Fetch;
   maxMediaEntries?: number;
 }
@@ -349,7 +357,7 @@ export class CloudApiSocket {
     const payload = object(data);
     if (payload?.object !== "whatsapp_business_account")
       return new Response("Ignored");
-    const pending = this.parseInbound(payload);
+    const { pending, statuses } = this.parseInbound(payload);
     const fresh: PendingInbound[] = [];
     const batchIds = new Set<string>();
     for (const entry of pending) {
@@ -360,8 +368,16 @@ export class CloudApiSocket {
     }
     if (this.stopped)
       return new Response("Webhook unavailable", { status: 503 });
-    if (this.queue.length + fresh.length + (this.draining ? 1 : 0) > MAX_QUEUE)
+    for (const status of statuses) this.deliverStatus(status);
+    if (
+      this.queue.length + fresh.length + (this.draining ? 1 : 0) >
+      MAX_QUEUE
+    ) {
+      this.reportError(
+        `Cloud API webhook queue full; ${fresh.length} message(s) rejected with 503`,
+      );
       return new Response("Webhook queue full", { status: 503 });
+    }
     for (const entry of fresh) {
       this.seen.add(entry.message.key.id!);
       while (this.seen.size > 1000)
@@ -375,6 +391,22 @@ export class CloudApiSocket {
     }
     void this.drain();
     return new Response("OK");
+  }
+
+  private reportError(safeMessage: string): void {
+    try {
+      this.options.onError?.(safeMessage);
+    } catch {}
+  }
+
+  /** Delivered outside the message queue so a full queue never hides send failures. */
+  private deliverStatus(status: CloudStatus): void {
+    const onStatus = this.options.onStatus;
+    if (!onStatus) return;
+    try {
+      const result = onStatus(status);
+      if (result instanceof Promise) result.catch(() => {});
+    } catch {}
   }
 
   private async drain(): Promise<void> {
@@ -398,9 +430,13 @@ export class CloudApiSocket {
     }
   }
 
-  private parseInbound(payload: ObjectValue): PendingInbound[] {
+  private parseInbound(payload: ObjectValue): {
+    pending: PendingInbound[];
+    statuses: CloudStatus[];
+  } {
     const pending: PendingInbound[] = [];
-    if (!Array.isArray(payload.entry)) return pending;
+    const statuses: CloudStatus[] = [];
+    if (!Array.isArray(payload.entry)) return { pending, statuses };
     for (const entry of payload.entry) {
       const changes = object(entry)?.changes;
       if (!Array.isArray(changes)) continue;
@@ -410,10 +446,30 @@ export class CloudApiSocket {
         if (
           object(value?.metadata)?.phone_number_id !==
             this.config.phoneNumberId ||
-          value?.messaging_product !== "whatsapp" ||
-          !Array.isArray(value.messages)
+          value?.messaging_product !== "whatsapp"
         )
           continue;
+        if (Array.isArray(value.statuses)) {
+          for (const raw of value.statuses) {
+            const entry = object(raw);
+            const id = string(entry?.id);
+            const status = string(entry?.status);
+            const recipient = phoneJid(entry?.recipient_id);
+            if (!id || id.length > 512 || !status || !recipient) continue;
+            const errors: CloudStatus["errors"] = [];
+            if (Array.isArray(entry?.errors)) {
+              for (const rawError of entry.errors) {
+                const error = object(rawError);
+                const code = error?.code;
+                const title = string(error?.title);
+                if (typeof code === "number" && Number.isFinite(code) && title)
+                  errors.push({ code, title });
+              }
+            }
+            statuses.push({ id, recipient, status, errors });
+          }
+        }
+        if (!Array.isArray(value.messages)) continue;
         for (const raw of value.messages) {
           const message = object(raw);
           const id = string(message?.id);
@@ -444,8 +500,15 @@ export class CloudApiSocket {
               }
             : undefined;
           const type = string(message.type);
-          if (type === "text") {
-            const text = string(object(message.text)?.body);
+          if (type === "text" || type === "button" || type === "interactive") {
+            const interactive = object(message.interactive);
+            const text =
+              type === "text"
+                ? string(object(message.text)?.body)
+                : type === "button"
+                  ? string(object(message.button)?.text)
+                  : (string(object(interactive?.button_reply)?.title) ??
+                    string(object(interactive?.list_reply)?.title));
             if (text === undefined) continue;
             normalized.message = {
               extendedTextMessage: {
@@ -496,12 +559,18 @@ export class CloudApiSocket {
               };
             pending.push({ message: normalized, media: { id: mediaId, jid } });
             continue;
-          } else continue;
+          } else {
+            if (type)
+              this.reportError(
+                `Cloud API dropped unsupported inbound type ${/^[a-z_]{1,32}$/.test(type) ? type : "unknown"}`,
+              );
+            continue;
+          }
           pending.push({ message: normalized });
         }
       }
     }
-    return pending;
+    return { pending, statuses };
   }
 
   async sendMessage(

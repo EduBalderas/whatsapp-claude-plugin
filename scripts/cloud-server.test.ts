@@ -18,20 +18,21 @@ async function until(check: () => boolean): Promise<void> {
   expect(check()).toBe(true);
 }
 
-test("real Cloud MCP server preserves access, permission identity and singleton relay", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "wa-cloud-server-"));
+type Spawned = ReturnType<typeof spawn>;
+type CloudServer = Awaited<ReturnType<typeof startCloudServer>>;
+
+/** Spawns the real MCP server in Cloud mode against a temp state dir, with
+ *  Graph stubbed in the child and every request recorded to graph-fixture.jsonl.
+ *  Resolves once initialize answered and the webhook listener is ready. Pass an
+ *  existing `dir` to restart over the same state (messages.jsonl survives). */
+async function startCloudServer(
+  access: Record<string, unknown>,
+  options: { dir?: string } = {},
+) {
+  const dir = options.dir ?? mkdtempSync(join(tmpdir(), "wa-cloud-server-"));
   const graphLog = join(dir, "graph-fixture.jsonl");
   const preload = join(dir, "graph-fixture.ts");
-  const personal = "886900000001@s.whatsapp.net";
-  const stranger = "886900000002@s.whatsapp.net";
   const accessPath = join(dir, "access.json");
-  const access = {
-    dmPolicy: "allowlist",
-    allowFrom: [personal],
-    owner: personal,
-    groups: {},
-    pending: {},
-  };
   writeFileSync(accessPath, JSON.stringify(access));
   // Isolate Graph in the child process; no real Meta connection or message send.
   writeFileSync(
@@ -108,28 +109,30 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
   }
   const text = (result: any): string =>
     result.content.map((item: any) => item.text ?? "").join("\n");
+  const graphEntries = (): any[] =>
+    existsSync(graphLog)
+      ? readFileSync(graphLog, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+      : [];
   const graphSends = () =>
-    readFileSync(graphLog, "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line).payload)
+    graphEntries()
+      .map((entry) => entry.payload)
       .filter(Boolean);
-  let secondary: ReturnType<typeof spawn> | undefined;
-  async function deliver(
-    from: string,
-    id: string,
-    body: string,
-    reactionId?: string,
-  ): Promise<Response> {
-    const message = {
-      from,
-      id,
-      timestamp: String(Math.floor(Date.now() / 1000)),
-      type: reactionId ? "reaction" : "text",
-      ...(reactionId
-        ? { reaction: { message_id: reactionId, emoji: body } }
-        : { text: { body } }),
-    };
+  const loggedLines = (): any[] => {
+    const path = join(dir, "messages.jsonl");
+    return existsSync(path)
+      ? readFileSync(path, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+      : [];
+  };
+  const notified = (id: string) =>
+    notifications.some((entry) => entry.params?.meta?.message_id === id);
+  async function post(message: Record<string, unknown>): Promise<Response> {
     const raw = JSON.stringify({
       object: "whatsapp_business_account",
       entry: [
@@ -157,6 +160,36 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
       },
     });
   }
+  async function deliver(
+    from: string,
+    id: string,
+    body: string,
+    reactionId?: string,
+    timestampSeconds = Math.floor(Date.now() / 1000),
+  ): Promise<Response> {
+    return post({
+      from,
+      id,
+      timestamp: String(timestampSeconds),
+      type: reactionId ? "reaction" : "text",
+      ...(reactionId
+        ? { reaction: { message_id: reactionId, emoji: body } }
+        : { text: { body } }),
+    });
+  }
+  const stopProcess = async (process: Spawned) => {
+    if (process.exitCode !== null) return;
+    process.kill("SIGTERM");
+    await Promise.race([
+      new Promise((resolve) => process.once("exit", resolve)),
+      pause(3000),
+    ]);
+    if (process.exitCode === null) process.kill("SIGKILL");
+  };
+  async function close(closeOptions: { keepDir?: boolean } = {}) {
+    await stopProcess(child);
+    if (!closeOptions.keepDir) rmSync(dir, { recursive: true, force: true });
+  }
   try {
     send({
       jsonrpc: "2.0",
@@ -173,6 +206,73 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
         replies.has(1) && stderr.includes("Official Cloud API listener ready"),
     );
     send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  } catch (err) {
+    await close({ keepDir: Boolean(options.dir) });
+    throw err;
+  }
+  return {
+    dir,
+    accessPath,
+    preload,
+    environment,
+    replies,
+    notifications,
+    stderr: () => stderr,
+    send,
+    tool,
+    text,
+    graphEntries,
+    graphSends,
+    loggedLines,
+    notified,
+    deliver,
+    stopProcess,
+    close,
+  };
+}
+
+const permissionRequest = (requestId: string) => ({
+  jsonrpc: "2.0",
+  method: "notifications/claude/channel/permission_request",
+  params: {
+    request_id: requestId,
+    tool_name: "Bash",
+    description: "Fixture approval",
+    input_preview: '{"command":"echo fixture"}',
+  },
+});
+
+test("real Cloud MCP server preserves access, permission identity and singleton relay", async () => {
+  const personal = "886900000001@s.whatsapp.net";
+  const stranger = "886900000002@s.whatsapp.net";
+  // ownerExplicit: Cloud only routes permission requests to an owner set with
+  // `access set owner` (see the ownerExplicit test below).
+  const access = {
+    dmPolicy: "allowlist",
+    allowFrom: [personal],
+    owner: personal,
+    ownerExplicit: true,
+    groups: {},
+    pending: {},
+  };
+  const server = await startCloudServer(access);
+  const {
+    dir,
+    accessPath,
+    preload,
+    environment,
+    replies,
+    notifications,
+    send,
+    tool,
+    text,
+    graphEntries,
+    graphSends,
+    deliver,
+    stopProcess,
+  } = server;
+  let secondary: Spawned | undefined;
+  try {
     send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     await until(() => replies.has(2));
     const names = replies.get(2).result.tools.map((entry: any) => entry.name);
@@ -285,7 +385,7 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
       },
     });
     await until(() =>
-      stderr.includes("permission_request request-two not sent"),
+      server.stderr().includes("permission_request request-two not sent"),
     );
     expect(graphSends()).toHaveLength(3);
 
@@ -310,7 +410,7 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
       },
     });
     await until(() =>
-      stderr.includes("permission_request request-self not sent"),
+      server.stderr().includes("permission_request request-self not sent"),
     );
     expect(graphSends()).toHaveLength(3);
 
@@ -322,12 +422,7 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
       (await tool("reply", { chat_id: personal, text: "# Markdown reply" }))
         .isError,
     ).not.toBe(true);
-    const uploads = () =>
-      readFileSync(graphLog, "utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line))
-        .filter((entry) => entry.uploadMime);
+    const uploads = () => graphEntries().filter((entry) => entry.uploadMime);
     expect(uploads().at(-1).uploadMime.split(";")[0]).toBe("text/plain");
     expect(graphSends().at(-1).type).toBe("document");
     const video = join(dir, "inbox", "clip.mp4");
@@ -359,20 +454,183 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
     await until(() => secondaryError.includes("ipc: connected to primary"));
     expect(secondaryError).not.toContain("Official Cloud API listener ready");
     expect(secondaryError).not.toContain("webhook listener could not start");
-    expect(stderr).not.toContain("test-access-token");
-    expect(stderr).not.toContain("test-app-secret");
+    expect(server.stderr()).not.toContain("test-access-token");
+    expect(server.stderr()).not.toContain("test-app-secret");
   } finally {
-    const stop = async (process: ReturnType<typeof spawn>) => {
-      if (process.exitCode !== null) return;
-      process.kill("SIGTERM");
-      await Promise.race([
-        new Promise((resolve) => process.once("exit", resolve)),
-        pause(3000),
-      ]);
-      if (process.exitCode === null) process.kill("SIGKILL");
-    };
-    if (secondary) await stop(secondary);
-    await stop(child);
-    rmSync(dir, { recursive: true, force: true });
+    if (secondary) await stopProcess(secondary);
+    await server.close();
+  }
+}, 60000);
+
+const owner = "886900000001@s.whatsapp.net";
+
+test("Cloud connect locks dmPolicy pairing to allowlist and never sends a pairing code", async () => {
+  const server = await startCloudServer({
+    dmPolicy: "pairing",
+    allowFrom: [owner],
+    groups: {},
+    pending: {},
+  });
+  try {
+    const stored = JSON.parse(readFileSync(server.accessPath, "utf8"));
+    expect(stored.dmPolicy).toBe("allowlist");
+    expect(stored.allowFrom).toEqual([owner]);
+    expect(readFileSync(join(server.dir, "diag.log"), "utf8")).toContain(
+      "dmPolicy pairing → allowlist",
+    );
+
+    expect(
+      (await server.deliver("886900000009", "customer-msg", "hi")).status,
+    ).toBe(200);
+    // Inbound is drained serially, so the owner's notification proves the
+    // customer's message was already handled.
+    await server.deliver("886900000001", "owner-barrier", "barrier");
+    await until(() => server.notified("owner-barrier"));
+    await pause(100);
+    expect(server.graphSends()).toHaveLength(0);
+    expect(server.notified("customer-msg")).toBe(false);
+    expect(JSON.parse(readFileSync(server.accessPath, "utf8")).pending).toEqual(
+      {},
+    );
+  } finally {
+    await server.close();
+  }
+}, 60000);
+
+test("Cloud drops a replayed message id, across POSTs and across a restart", async () => {
+  const access = {
+    dmPolicy: "allowlist",
+    allowFrom: [owner],
+    groups: {},
+    pending: {},
+  };
+  const timestamp = Math.floor(Date.now() / 1000);
+  const inLines = (server: CloudServer) =>
+    server
+      .loggedLines()
+      .filter((line) => line.id === "replayed-msg" && line.direction === "in");
+  let server = await startCloudServer(access);
+  const dir = server.dir;
+  try {
+    await server.deliver(
+      owner.split("@")[0],
+      "replayed-msg",
+      "once",
+      undefined,
+      timestamp,
+    );
+    await until(() => server.notified("replayed-msg"));
+    await server.deliver(
+      owner.split("@")[0],
+      "replayed-msg",
+      "once",
+      undefined,
+      timestamp,
+    );
+    await server.deliver(owner.split("@")[0], "barrier-1", "barrier");
+    await until(() => server.notified("barrier-1"));
+    expect(inLines(server)).toHaveLength(1);
+
+    // CloudApiSocket's in-memory seen-set dies with the process; only the
+    // messages.jsonl check stops Meta's redelivery after a restart.
+    await server.close({ keepDir: true });
+    server = await startCloudServer(access, { dir });
+    await server.deliver(
+      owner.split("@")[0],
+      "replayed-msg",
+      "once",
+      undefined,
+      timestamp,
+    );
+    await server.deliver(owner.split("@")[0], "barrier-2", "barrier");
+    await until(() => server.notified("barrier-2"));
+    expect(inLines(server)).toHaveLength(1);
+    expect(server.notified("replayed-msg")).toBe(false);
+  } finally {
+    await server.close();
+  }
+}, 60000);
+
+test("Cloud records offline backlog without acting on it", async () => {
+  const server = await startCloudServer({
+    dmPolicy: "allowlist",
+    allowFrom: [owner],
+    groups: {},
+    pending: {},
+    ackReaction: "👀",
+  });
+  try {
+    const requestsBefore = server.graphEntries().length;
+    const tenMinutesAgo = Math.floor((Date.now() - 10 * 60_000) / 1000);
+    await server.deliver(
+      "886900000001",
+      "backlog-msg",
+      "while offline",
+      undefined,
+      tenMinutesAgo,
+    );
+    await until(() =>
+      server.loggedLines().some((line) => line.id === "backlog-msg"),
+    );
+    const backlogLine = server
+      .loggedLines()
+      .find((line) => line.id === "backlog-msg");
+    expect(backlogLine.direction).toBe("in");
+    expect(backlogLine.text).toBe("while offline");
+    expect(backlogLine.replied).toBe(false);
+    // No ack reaction, no presence, no download: not one Graph request.
+    await pause(300);
+    expect(server.graphEntries()).toHaveLength(requestsBefore);
+
+    // The same message arriving live does get the ack reaction.
+    await server.deliver("886900000001", "fresh-msg", "now");
+    await until(() => server.notified("fresh-msg"));
+    await until(() =>
+      server
+        .graphSends()
+        .some((sent) => sent.reaction?.message_id === "fresh-msg"),
+    );
+    expect(
+      server
+        .graphSends()
+        .some((sent) => sent.reaction?.message_id === "backlog-msg"),
+    ).toBe(false);
+    expect(server.notified("backlog-msg")).toBe(false);
+    expect(server.text(await server.tool("unreplied"))).toContain(
+      "while offline",
+    );
+  } finally {
+    await server.close();
+  }
+}, 60000);
+
+test("Cloud sends permission requests only to an ownerExplicit owner", async () => {
+  const access = {
+    dmPolicy: "allowlist",
+    allowFrom: [owner],
+    owner,
+    groups: {},
+    pending: {},
+  };
+  const server = await startCloudServer(access);
+  try {
+    server.send(permissionRequest("request-implicit"));
+    await until(() =>
+      server.stderr().includes("permission_request request-implicit not sent"),
+    );
+    expect(server.graphSends()).toHaveLength(0);
+
+    writeFileSync(
+      server.accessPath,
+      JSON.stringify({ ...access, ownerExplicit: true }),
+    );
+    server.send(permissionRequest("request-explicit"));
+    await until(() => server.graphSends().length === 1);
+    expect(server.graphSends()[0].to).toBe("886900000001");
+    expect(server.stderr()).not.toContain(
+      "permission_request request-explicit not sent",
+    );
+  } finally {
+    await server.close();
   }
 }, 60000);

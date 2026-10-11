@@ -1,10 +1,17 @@
 #!/usr/bin/env bun
 import { input, password, select } from "@inquirer/prompts";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readCloudApiConfig } from "../lib/cloud-api";
 import {
+  type ChannelProvider,
   channelProvider,
   configuredValue,
   parseStateEnv,
@@ -16,11 +23,88 @@ const stateDir =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
 const envFile = join(stateDir, ".env");
 
+// Status and the picker must still render when the saved value is a typo;
+// only `set` is strict, because it is the way out.
+function savedProvider(
+  env: Record<string, string | undefined>,
+): ChannelProvider | null {
+  try {
+    return channelProvider(env);
+  } catch {
+    return null;
+  }
+}
+
+// Atomic replace of the state .env: 0600 from the first byte, and a
+// crashed write never leaves a half-written file behind the real one.
+function writeStateEnv(next: string): void {
+  parseStateEnv(next);
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const temporary = `${envFile}.${process.pid}.tmp`;
+  // A stale temp from a reused pid would make `wx` fail; a failed rename
+  // must not leave a second copy of the credentials behind.
+  rmSync(temporary, { force: true });
+  writeFileSync(temporary, next, { mode: 0o600, flag: "wx" });
+  try {
+    renameSync(temporary, envFile);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
+function readStateEnvRaw(): string {
+  try {
+    return readFileSync(envFile, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return "";
+  }
+}
+
 async function main(): Promise<void> {
   const [command = "choose", requested] = process.argv.slice(2);
   const env = stateEnvironment(envFile);
+  // `phone <digits>` / `phone clear` is how the configure skill sets the
+  // linked-device number. It exists so the skill never needs Read/Edit on
+  // .env, which may now hold Cloud credentials that must not reach model
+  // context. No TTY requirement: the value is not a secret.
+  if (command === "phone") {
+    const digits = requested?.trim();
+    if (digits === "clear") {
+      const kept = readStateEnvRaw()
+        .replace(/^\uFEFF/, "")
+        .split(/\r?\n/)
+        .filter((line) => !/^WHATSAPP_PHONE_NUMBER=/.test(line));
+      while (kept.at(-1) === "") kept.pop();
+      writeStateEnv(kept.length ? kept.join("\n") + "\n" : "");
+      console.log("Cleared WHATSAPP_PHONE_NUMBER; other settings kept.");
+      return;
+    }
+    if (!digits || !/^\d{5,20}$/.test(digits))
+      throw new Error(
+        "Usage: bun scripts/provider.ts phone <5-20 digits, no leading +> | clear",
+      );
+    writeStateEnv(
+      updateStateEnv(readStateEnvRaw(), { WHATSAPP_PHONE_NUMBER: digits }),
+    );
+    console.log(
+      `Saved WHATSAPP_PHONE_NUMBER (…${digits.slice(-4)}). Restart every Claude session using this state directory.`,
+    );
+    return;
+  }
   if (command === "status") {
-    const provider = channelProvider(env);
+    const phone = configuredValue(env.WHATSAPP_PHONE_NUMBER);
+    console.log(
+      `Phone number: ${phone ? `set (…${phone.slice(-4)})` : "not set"}`,
+    );
+    const provider = savedProvider(env);
+    if (!provider) {
+      console.log(
+        `Connection: invalid (${env.WHATSAPP_PROVIDER?.trim()}) — run: bun scripts/provider.ts set baileys|cloud-api`,
+      );
+      return;
+    }
     console.log(
       `Connection: ${provider === "baileys" ? "Linked device (Baileys)" : "Official WhatsApp Cloud API"}`,
     );
@@ -40,7 +124,7 @@ async function main(): Promise<void> {
   }
   if (command !== "choose" && command !== "set")
     throw new Error(
-      "Usage: bun scripts/provider.ts [choose | status | set baileys | set cloud-api]",
+      "Usage: bun scripts/provider.ts [choose | status | set baileys | set cloud-api | phone <digits>|clear]",
     );
   if (!process.stdin.isTTY || !process.stdout.isTTY)
     throw new Error(
@@ -51,7 +135,7 @@ async function main(): Promise<void> {
       ? channelProvider({ WHATSAPP_PROVIDER: requested ?? "invalid" })
       : await select({
           message: "Choose your WhatsApp connection",
-          default: channelProvider(env),
+          default: savedProvider(env) ?? "baileys",
           choices: [
             {
               value: "baileys",
@@ -102,26 +186,14 @@ async function main(): Promise<void> {
     }
     readCloudApiConfig({ ...env, ...updates });
   }
-  let raw = "";
-  try {
-    raw = readFileSync(envFile, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
   // Preserve every unrelated key, including credentials for the other provider.
-  const next = updateStateEnv(raw, updates);
-  parseStateEnv(next);
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const temporary = `${envFile}.${process.pid}.tmp`;
-  writeFileSync(temporary, next, { mode: 0o600, flag: "wx" });
-  renameSync(temporary, envFile);
+  writeStateEnv(updateStateEnv(readStateEnvRaw(), updates));
   console.log(
     `Saved connection: ${provider}. Restart every Claude session using this state directory.`,
   );
-  if (configuredValue(process.env.WHATSAPP_PROVIDER))
-    console.log(
-      "A process/plugin WHATSAPP_PROVIDER override is active; change it too for this selection to take effect.",
-    );
+  console.log(
+    `Values saved in ${envFile} take precedence over plugin /config settings for the keys it contains. To return a setting to plugin management, remove its key from that file.`,
+  );
   if (provider === "cloud-api") {
     console.log(
       "Expose the local /webhook endpoint through HTTPS, configure Meta's callback/verify token and subscribe this WABA to messages.",

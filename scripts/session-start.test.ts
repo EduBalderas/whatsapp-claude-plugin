@@ -28,11 +28,16 @@ afterAll(() => {
   for (const dir of fixtures) rmSync(dir, { recursive: true, force: true });
 });
 
-function runHookRaw(dir: string): Record<string, any> {
+function runHookRaw(
+  dir: string,
+  overrides: Record<string, string> = {},
+): Record<string, any> {
   return JSON.parse(
     execFileSync("bash", [HOOK], {
       env: {
         ...process.env,
+        CLAUDE_PLUGIN_OPTION_CONNECTION_PROVIDER: "",
+        ...overrides,
         WHATSAPP_STATE_DIR: dir,
         WHATSAPP_PROVIDER: "",
         WHATSAPP_CLOUD_PHONE_NUMBER_ID: "",
@@ -45,8 +50,9 @@ function runHookRaw(dir: string): Record<string, any> {
   );
 }
 
-function runHook(dir: string): string {
-  return runHookRaw(dir).hookSpecificOutput.additionalContext as string;
+function runHook(dir: string, overrides: Record<string, string> = {}): string {
+  return runHookRaw(dir, overrides).hookSpecificOutput
+    .additionalContext as string;
 }
 
 // A state dir as the current code actually writes it: pretty-printed JSON
@@ -75,14 +81,40 @@ function configuredStateDir(opts: { allowFrom: string[] }): string {
 }
 
 describe("session-start.sh", () => {
-  test("legacy state defers to the effective MCP provider before pairing guidance", () => {
+  test("legacy state names the effective provider before pairing guidance", () => {
     const dir = configuredStateDir({ allowFrom: [] });
     const message = runHook(dir);
-    expect(message).toContain("linked-device mode only");
-    expect(message).toContain("Plugin userConfig may select Cloud API");
-    expect(message.indexOf("Check the effective connection")).toBeLessThan(
+    expect(message).toContain("Effective connection: linked device");
+    expect(message).not.toContain("plugin setting");
+    expect(message.indexOf("Effective connection")).toBeLessThan(
       message.indexOf("owner JID is auto-added"),
     );
+  });
+
+  // Claude Code exports plugin userConfig to hooks as CLAUDE_PLUGIN_OPTION_*.
+  test("plugin cloud-api selection applies when no provider is saved", () => {
+    const dir = configuredStateDir({ allowFrom: [] });
+    const message = runHook(dir, {
+      CLAUDE_PLUGIN_OPTION_CONNECTION_PROVIDER: "cloud-api",
+    });
+    expect(message).toContain("Official WhatsApp Cloud API is selected");
+    expect(message).not.toContain("plugin setting");
+  });
+
+  test("a terminal-saved provider overrides a different plugin selection, and says so", () => {
+    const dir = configuredStateDir({ allowFrom: [] });
+    writeFileSync(
+      join(dir, ".env"),
+      "WHATSAPP_PHONE_NUMBER=886900000000\nWHATSAPP_PROVIDER=baileys\n",
+    );
+    const message = runHook(dir, {
+      CLAUDE_PLUGIN_OPTION_CONNECTION_PROVIDER: "cloud-api",
+    });
+    expect(message).toContain(
+      "The terminal-saved provider baileys is in effect; the plugin setting cloud-api is ignored.",
+    );
+    expect(message).toContain("no contacts are allowlisted yet");
+    expect(message).not.toContain('"');
   });
 
   // Regression: the old check grepped the file for compact
@@ -182,6 +214,7 @@ describe("Cloud API session onboarding", () => {
           dmPolicy: "allowlist",
           allowFrom: ["12345@s.whatsapp.net"],
           owner: "12345@s.whatsapp.net",
+          ownerExplicit: true,
           groups: {},
         }),
       );
@@ -224,6 +257,32 @@ describe("Cloud API session onboarding", () => {
     const out = runHook(cloudState(true, true));
     expect(out).not.toContain("Set an explicitly allowlisted personal owner");
     expect(out).toContain("test an approved personal DM");
+  });
+
+  test("an owner inherited from linked-device mode must be re-set", () => {
+    const dir = cloudState(true, true);
+    writeFileSync(
+      join(dir, "access.json"),
+      JSON.stringify({
+        dmPolicy: "allowlist",
+        allowFrom: ["12345@s.whatsapp.net"],
+        owner: "12345@s.whatsapp.net",
+        groups: {},
+      }),
+    );
+    const out = runHook(dir);
+    expect(out).toContain("inherited from linked-device mode");
+    expect(out).toContain("access set owner");
+  });
+
+  test("a saved cloud-api provider overrides a plugin baileys selection, and says so", () => {
+    const out = runHook(cloudState(), {
+      CLAUDE_PLUGIN_OPTION_CONNECTION_PROVIDER: "baileys",
+    });
+    expect(out).toContain("configuration is present");
+    expect(out).toContain(
+      "The terminal-saved provider cloud-api is in effect; the plugin setting baileys is ignored.",
+    );
   });
 
   test("Cloud configurations receive release notices without claiming connection", () => {

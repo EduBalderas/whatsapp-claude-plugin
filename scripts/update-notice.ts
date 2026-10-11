@@ -59,8 +59,9 @@ if (!isStaticMode()) {
     {
       version: "0.27.0",
       notes: [
-        "Choose linked device or official Cloud API in setup; existing installs keep Baileys.",
-        "Cloud API supports business DMs, attachments and approved templates; Meta rules and fees apply.",
+        "Setup now lets you choose linked device or official Cloud API.",
+        "Existing installs stay on linked device (Baileys) unless you switch.",
+        "Cloud API (experimental, untested on a live Meta account): DMs, attachments, templates.",
       ],
     },
     {

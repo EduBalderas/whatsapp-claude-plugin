@@ -457,6 +457,7 @@ describe("Cloud API provider", () => {
         dmPolicy: "allowlist",
         allowFrom: ["12345@s.whatsapp.net"],
         owner: "12345@s.whatsapp.net",
+        ownerExplicit: true,
         groups: { "456@g.us": {} },
         pending: {},
       }),
@@ -465,6 +466,27 @@ describe("Cloud API provider", () => {
     expect(out).toContain("[PASS] cloud-owner:");
     expect(out).toContain("[WARN] cloud-groups:");
     expect(out).not.toContain("[INFO] group-configs:");
+  });
+
+  // Linked-device mode stamps allowFrom[0] as owner by itself; after a
+  // Cloud -> Baileys -> Cloud round-trip that is the first customer.
+  test("an owner without ownerExplicit is inherited, not a Cloud owner", () => {
+    const dir = cloudState();
+    writeFileSync(
+      join(dir, "access.json"),
+      JSON.stringify({
+        dmPolicy: "allowlist",
+        allowFrom: ["12345@s.whatsapp.net"],
+        owner: "12345@s.whatsapp.net",
+        groups: {},
+        pending: {},
+      }),
+    );
+    const out = runDoctor(dir);
+    expect(out).toContain("[WARN] cloud-owner:");
+    expect(out).toContain("inherited from linked-device mode");
+    expect(out).toContain("access set owner");
+    expect(out).not.toContain("[PASS] cloud-owner:");
   });
 
   test("unknown provider cannot fall back to linked device", () => {

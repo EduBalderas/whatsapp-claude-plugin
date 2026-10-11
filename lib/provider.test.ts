@@ -20,20 +20,49 @@ describe("provider configuration", () => {
     ).toBe("baileys");
     expect(() => channelProvider({ WHATSAPP_PROVIDER: "typo" })).toThrow();
   });
-  test("saved settings survive empty plugin fields while real env wins", () => {
+  test("saved settings win over plugin env; plugin env fills only missing or blank keys", () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-provider-"));
     try {
       const path = join(dir, ".env");
       writeFileSync(
         path,
-        '\uFEFFWHATSAPP_PROVIDER="cloud-api"\r\nWHATSAPP_CLOUD_ACCESS_TOKEN=test-token\r\n',
+        '\uFEFFWHATSAPP_PROVIDER="baileys"\r\nWHATSAPP_CLOUD_ACCESS_TOKEN=test-token\r\nWHATSAPP_CLOUD_APP_SECRET=\r\n',
       );
       const env = stateEnvironment(path, {
-        WHATSAPP_PROVIDER: "",
+        WHATSAPP_PROVIDER: "cloud-api",
         WHATSAPP_CLOUD_ACCESS_TOKEN: "override",
+        WHATSAPP_CLOUD_APP_SECRET: "plugin-secret",
+        WHATSAPP_CLOUD_VERIFY_TOKEN: "plugin-verify",
       });
-      expect(channelProvider(env)).toBe("cloud-api");
-      expect(env.WHATSAPP_CLOUD_ACCESS_TOKEN).toBe("override");
+      expect(channelProvider(env)).toBe("baileys");
+      expect(env.WHATSAPP_CLOUD_ACCESS_TOKEN).toBe("test-token");
+      expect(env.WHATSAPP_CLOUD_APP_SECRET).toBe("plugin-secret");
+      expect(env.WHATSAPP_CLOUD_VERIFY_TOKEN).toBe("plugin-verify");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("plugin env selects the provider when the saved file lacks it, and blank env never masks the file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-provider-"));
+    try {
+      const path = join(dir, ".env");
+      writeFileSync(path, "WHATSAPP_PHONE_NUMBER=123456789\n");
+      expect(
+        channelProvider(
+          stateEnvironment(path, { WHATSAPP_PROVIDER: "cloud-api" }),
+        ),
+      ).toBe("cloud-api");
+      writeFileSync(path, "WHATSAPP_PROVIDER=cloud-api\n");
+      expect(
+        channelProvider(
+          stateEnvironment(path, {
+            WHATSAPP_PROVIDER: "${user_config.connection_provider}",
+          }),
+        ),
+      ).toBe("cloud-api");
+      expect(
+        channelProvider(stateEnvironment(path, { WHATSAPP_PROVIDER: "" })),
+      ).toBe("cloud-api");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
