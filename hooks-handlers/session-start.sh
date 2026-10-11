@@ -54,7 +54,8 @@ fi
 # provider_scope - it prefixes every branch below and is interpolated raw
 # into the heredoc's JSON. The mismatch sentence only ever inserts fixed text.
 provider_scope="Effective connection: linked device (Baileys, the default). "
-saved_provider="$(sed -n 's/^WHATSAPP_PROVIDER=//p' "${ENV_FILE}" 2>/dev/null | tail -n 1 | tr -d "\"'[:space:]")"
+# `|| true`: a missing .env is the normal first-run state, not an error.
+saved_provider="$(sed -n 's/^WHATSAPP_PROVIDER=//p' "${ENV_FILE}" 2>/dev/null | tail -n 1 | tr -d "\"'[:space:]" || true)"
 plugin_provider="$(tr -d '[:space:]' <<<"${CLAUDE_PLUGIN_OPTION_CONNECTION_PROVIDER-}")"
 if [[ ${saved_provider} == baileys && ${plugin_provider} == cloud-api ]]; then
 	provider_scope+="The terminal-saved provider baileys is in effect; the plugin setting cloud-api is ignored. "
