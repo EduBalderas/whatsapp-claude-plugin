@@ -68,6 +68,7 @@ import { caseSafeKeys } from "./lib/auth-keys";
 import { cronMatches, parseCronSection } from "./lib/cron";
 import { extractMentions, extractText } from "./lib/inbound-message";
 import { parseMaxStore } from "./lib/max-store";
+import { procStartTicks } from "./lib/proc-start";
 import { logContainsId } from "./lib/message-log-probe";
 import { ownerStamp, parsePermissionReply } from "./lib/owner";
 import {
@@ -4482,9 +4483,16 @@ process.on("SIGINT", shutdown);
 // tick, so use a signal-0 liveness check there instead. Known ceiling: a
 // PID reused within one tick would mask a dead parent; hold a handle
 // (Wait-Process) if that ever bites.
+// Linux: compare /proc start ticks, not `ps -o lstart`. procps derives lstart
+// from the wall clock, so when a VM's clock is stepped (e.g. Docker Desktop's)
+// a live parent's lstart shifts by a second and is read as "parent gone": the
+// server shut itself down under a running session, 3 times in 4 days on one
+// Docker install, and stayed down until the session was restarted.
+const parentStartTime = (pid: number) =>
+  process.platform === "linux" ? procStartTicks(pid) : processStartTime(pid);
 const PARENT_PID = process.ppid;
 let PARENT_START =
-  process.platform === "win32" ? undefined : processStartTime(PARENT_PID);
+  process.platform === "win32" ? undefined : parentStartTime(PARENT_PID);
 let parentMisses = 0;
 setInterval(() => {
   if (PARENT_START === null) return; // parent already gone at startup
@@ -4492,7 +4500,7 @@ setInterval(() => {
   if (process.platform === "win32") {
     gone = !pidAlive(PARENT_PID);
   } else {
-    const now = processStartTime(PARENT_PID);
+    const now = parentStartTime(PARENT_PID);
     if (now === undefined) return; // probe failed: no evidence either way
     if (PARENT_START === undefined) {
       PARENT_START = now; // startup probe failed: arm from the first good one

@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.27.2",
+      notes: [
+        "Linux: a VM clock resync no longer makes the server think Claude exited and shut down.",
+      ],
+    },
+    {
       version: "0.27.1",
       notes: [
         "Baileys upgraded to rc14: rc12 threw away the phone's own contact and history sync on a new link.",
