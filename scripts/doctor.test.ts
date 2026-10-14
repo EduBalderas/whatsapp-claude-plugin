@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { formatLock, lockIdentity } from "../lib/start-time";
 
 // Creates a sparse file of an exact byte size without writing real data, so
 // boundary tests at hundreds of MB run instantly and cost near-zero disk.
@@ -66,7 +67,7 @@ function freshStateDir(): string {
   return dir;
 }
 
-// lstart of a live pid, exactly as doctor computes it
+// lstart of a live pid: lock line 2, and on Linux the pre-0.27.3 legacy path
 function lstart(pid: number): string {
   // Same probe doctor uses. `ps -o lstart=` does not exist on Windows, so this
   // helper has to branch too or every live-lock test is red there.
@@ -145,6 +146,36 @@ describe("server lock", () => {
     const out = runDoctor(dir);
     expect(out).toContain("[PASS] server: server running (pid " + process.pid);
   });
+  // Since 0.27.3 a Linux lock has a fourth line (start ticks @ boot id) and
+  // doctor judges by it; the lstart test above is then the legacy-lock path.
+  // On macOS and Windows there is no fourth line and both tests plant the
+  // same bytes.
+  test("live lock in the current form (with line 4 on Linux) → PASS", () => {
+    const dir = freshStateDir();
+    writeFileSync(
+      join(dir, ".server.lock"),
+      formatLock(
+        process.pid,
+        lstart(process.pid),
+        "",
+        lockIdentity(process.pid),
+      ),
+    );
+    const out = runDoctor(dir);
+    expect(out).toContain("[PASS] server: server running (pid " + process.pid);
+  });
+  test.if(process.platform === "linux")(
+    "Linux: line 4 mismatch → stale even when lstart matches",
+    () => {
+      const dir = freshStateDir();
+      writeFileSync(
+        join(dir, ".server.lock"),
+        formatLock(process.pid, lstart(process.pid), "", "1@not-this-boot"),
+      );
+      const out = runDoctor(dir);
+      expect(out).toContain("[WARN] server: stale lock");
+    },
+  );
 });
 
 describe("access-config", () => {

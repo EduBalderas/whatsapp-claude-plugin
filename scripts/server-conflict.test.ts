@@ -1,30 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { formatLock, lockIdentity, processLstart } from "../lib/start-time";
+
 const SERVER = join(import.meta.dir, "..", "server.ts");
 
-// Same probe as server.ts, so the lock we plant names this test process as a
-// live holder the server cannot tell apart from a real one.
-function ownStartTime(): string {
-  const [cmd, args] =
-    process.platform === "win32"
-      ? [
-          `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `(Get-CimInstance Win32_Process -Filter "ProcessId=${process.pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
-          ],
-        ]
-      : ["ps", ["-p", String(process.pid), "-o", "lstart="]];
-  return execFileSync(cmd, args, {
-    encoding: "utf8",
-    windowsHide: true,
-  }).trim();
+// The lock exactly as server.ts writes it for this test process, so the
+// spawned server finds a live holder it cannot tell apart from a real one.
+// On Linux that includes the 0.27.3 fourth line; the ipc-*.test.ts rigs
+// plant the three-line pre-0.27.3 form and so cover the legacy path.
+function ownLock(): string {
+  const start = processLstart(process.pid);
+  if (typeof start !== "string") throw new Error(`own lstart: ${start}`);
+  return formatLock(process.pid, start, "", lockIdentity(process.pid));
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -32,10 +23,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 describe("conflict mode", () => {
   test("a refused server leaves the pairing handoff files alone", async () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-conflict-"));
-    writeFileSync(
-      join(dir, ".server.lock"),
-      `${process.pid}\n${ownStartTime()}\n\n`,
-    );
+    writeFileSync(join(dir, ".server.lock"), ownLock());
     mkdirSync(join(dir, "approved"));
     const handoff = join(dir, "approved", "886900000000@s.whatsapp.net");
     writeFileSync(handoff, "886900000000@s.whatsapp.net");

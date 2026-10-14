@@ -20,7 +20,7 @@ export function parseStartTicks(stat: string): string | null {
   return ticks && /^\d+$/.test(ticks) ? ticks : null;
 }
 
-// Same contract as server.ts's processStartTime: a string while the process
+// Same contract as lib/start-time.ts's processLstart: a string while the process
 // runs, null when there is no such process, undefined when the read could
 // not tell (callers must not read undefined as "dead").
 export function procStartTicks(
