@@ -41,7 +41,7 @@ import {
   isProviderKey,
 } from "./lib/provider";
 import { randomBytes, timingSafeEqual } from "crypto";
-import { execFile, execFileSync } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import {
   readFileSync,
@@ -68,7 +68,14 @@ import { caseSafeKeys } from "./lib/auth-keys";
 import { cronMatches, parseCronSection } from "./lib/cron";
 import { extractMentions, extractText } from "./lib/inbound-message";
 import { parseMaxStore } from "./lib/max-store";
-import { procStartTicks } from "./lib/proc-start";
+import {
+  formatLock,
+  lockHolderState,
+  lockIdentity,
+  parseLock,
+  processLstart,
+  processStartTime,
+} from "./lib/start-time";
 import { logContainsId } from "./lib/message-log-probe";
 import { ownerStamp, parsePermissionReply } from "./lib/owner";
 import {
@@ -283,48 +290,10 @@ mkdirSync(INBOX_DIR, { recursive: true });
 // making every new instance refuse to start forever. Matching the start time
 // tells a genuine duplicate apart from a reused PID.
 
-// Command that prints a per-incarnation start time for a PID, or nothing when
-// there is no such process. Windows has no `ps -o lstart`, so ask PowerShell —
-// via CIM, which unlike Get-Process can read the start time of a process the
-// caller does not own (an elevated session's server).
-function startTimeProbe(pid: number): [string, string[]] {
-  return process.platform === "win32"
-    ? [
-        // Absolute path: a bare "powershell.exe" resolves via cwd/PATH.
-        `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
-        ],
-      ]
-    : ["ps", ["-p", String(pid), "-o", "lstart="]];
-}
-const PROBE_OPTS = {
-  encoding: "utf8" as const,
-  stdio: ["ignore", "pipe", "ignore"] as ("ignore" | "pipe")[],
-  timeout: 5000,
-  windowsHide: true,
-};
-
-// OS start time of a process ("Sat May 16 07:43:46 2026" / a FILETIME on
-// Windows): a string if it is running, null if there is no such process, and
-// undefined if the probe could not tell (timeout, spawn failure, WMI error).
-// Callers must not read undefined as "dead" — that is how a lock fails open.
-function processStartTime(pid: number): string | null | undefined {
-  const [cmd, args] = startTimeProbe(pid);
-  try {
-    return execFileSync(cmd, args, PROBE_OPTS).trim() || null;
-  } catch (err) {
-    // ps exits 1 for "no such process"; on Windows a non-zero exit is a real
-    // PowerShell/WMI failure (not-found prints nothing and exits 0).
-    return process.platform !== "win32" &&
-      typeof (err as { status?: unknown }).status === "number"
-      ? null
-      : undefined;
-  }
-}
+// The identity itself, and the lock file's line format, live in
+// lib/start-time.ts (shared with doctor). Linux locks gained a clock-stable
+// fourth line in 0.27.3 because a VM clock step shifts every process's
+// `ps lstart`, so a lock written before the step read as stale afterwards.
 
 // Cheap liveness check with no spawn. EPERM = alive but not ours.
 function pidAlive(pid: number): boolean {
@@ -366,18 +335,23 @@ sweepStaleRoleFiles();
 type LockHolder = { pid: number; client: string };
 
 function acquireSingletonLock(quiet = false): LockHolder | null {
-  let myStart = processStartTime(process.pid);
-  if (myStart === undefined) myStart = processStartTime(process.pid); // one retry
+  let myStart = processLstart(process.pid);
+  if (myStart === undefined) myStart = processLstart(process.pid); // one retry
   if (myStart === undefined && !quiet) {
     logDiag(
-      `${LOG_PREFIX}: could not read own start time; lock will be written without one\n`,
+      `${LOG_PREFIX}: could not read own ps start time; lock line 2 will be empty\n`,
     );
   }
   // Line 3 is the client that spawned us, so a refused server and doctor can
   // name WHOSE connection this is with a string compare instead of a process
   // query (under Git Bash on Windows a hook's own $PPID is 1, so ancestry is
-  // not available there at all).
-  const mine = `${process.pid}\n${myStart ?? ""}\n${CLIENT_ID}\n`;
+  // not available there at all). Line 4 (Linux) is the clock-stable identity.
+  const mine = formatLock(
+    process.pid,
+    myStart,
+    CLIENT_ID,
+    lockIdentity(process.pid),
+  );
   for (let attempt = 0; ; attempt++) {
     // Atomic create: two instances racing here cannot both succeed.
     try {
@@ -401,23 +375,15 @@ function acquireSingletonLock(quiet = false): LockHolder | null {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
       raw = readLock();
     }
-    const [pidLine = "", startLine = "", clientLine = ""] = raw.split("\n");
-    const otherPid = Number(pidLine.trim());
-    const lockedStart = startLine.trim();
-    const otherClient = clientLine.trim();
+    const lock = parseLock(raw);
+    const otherPid = lock.pid;
+    const otherClient = lock.client;
     if (Number.isFinite(otherPid) && otherPid > 0 && otherPid !== process.pid) {
-      const currentStart = processStartTime(otherPid);
-      const alive =
-        currentStart === undefined ? pidAlive(otherPid) : currentStart !== null;
-      // Genuine duplicate: alive AND (started when the lock recorded, or the
-      // probe could not tell — fail closed rather than double-connect). A
-      // missing lockedStart is a legacy lock we can't verify — take over
-      // rather than risk a false refusal (the bug the start time fixes).
-      if (
-        alive &&
-        (currentStart === undefined ||
-          (lockedStart !== "" && currentStart === lockedStart))
-      ) {
+      // Genuine duplicate: the recorded holder is live, or the probe could
+      // not tell and the PID answers a signal — fail closed rather than
+      // double-connect. Stale (gone, or the PID was reused) is taken over.
+      const holder = lockHolderState(lock);
+      if (holder === "live" || (holder === "unknown" && pidAlive(otherPid))) {
         if (!quiet) {
           logDiag(
             `${LOG_PREFIX}: another whatsapp server is already running (pid ${otherPid}). ` +
@@ -1029,7 +995,7 @@ function startRetryLoop(everConnected = false): void {
 }
 
 // setTimeout chains, not setInterval: acquireSingletonLock() blocks the event
-// loop on a synchronous start-time probe (server.ts:155 — a PowerShell CIM
+// loop on a synchronous start-time probe (lib/start-time.ts — a PowerShell CIM
 // spawn on Windows) and connectToPrimary() can take IPC_PROBE_TIMEOUT_MS, so
 // fixed intervals would let ticks pile up on top of each other.
 // Both chains below are guarded at the top AND inside the timer callback, and
@@ -4483,16 +4449,15 @@ process.on("SIGINT", shutdown);
 // tick, so use a signal-0 liveness check there instead. Known ceiling: a
 // PID reused within one tick would mask a dead parent; hold a handle
 // (Wait-Process) if that ever bites.
-// Linux: compare /proc start ticks, not `ps -o lstart`. procps derives lstart
-// from the wall clock, so when a VM's clock is stepped (e.g. Docker Desktop's)
-// a live parent's lstart shifts by a second and is read as "parent gone": the
-// server shut itself down under a running session, 3 times in 4 days on one
-// Docker install, and stayed down until the session was restarted.
-const parentStartTime = (pid: number) =>
-  process.platform === "linux" ? procStartTicks(pid) : processStartTime(pid);
+// Linux: processStartTime is /proc start ticks, not `ps -o lstart`. procps
+// derives lstart from the wall clock, so when a VM's clock is stepped (e.g.
+// Docker Desktop's) a live parent's lstart shifts by a second and is read as
+// "parent gone": the server shut itself down under a running session, 3 times
+// in 4 days on one Docker install, and stayed down until the session was
+// restarted (PR #46).
 const PARENT_PID = process.ppid;
 let PARENT_START =
-  process.platform === "win32" ? undefined : parentStartTime(PARENT_PID);
+  process.platform === "win32" ? undefined : processStartTime(PARENT_PID);
 let parentMisses = 0;
 setInterval(() => {
   if (PARENT_START === null) return; // parent already gone at startup
@@ -4500,7 +4465,7 @@ setInterval(() => {
   if (process.platform === "win32") {
     gone = !pidAlive(PARENT_PID);
   } else {
-    const now = parentStartTime(PARENT_PID);
+    const now = processStartTime(PARENT_PID);
     if (now === undefined) return; // probe failed: no evidence either way
     if (PARENT_START === undefined) {
       PARENT_START = now; // startup probe failed: arm from the first good one

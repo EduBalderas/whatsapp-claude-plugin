@@ -29,6 +29,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { CRON_SECTION_RE, parseCronSection } from "../lib/cron";
 import { readCloudApiConfig } from "../lib/cloud-api";
+import { lockHolderState, parseLock } from "../lib/start-time";
 import {
   channelProvider,
   stateEnvironment,
@@ -86,39 +87,6 @@ function report(sev: Severity, id: string, msg: string, fix?: Fix): void {
 }
 
 // ── portable process helpers ────────────────────────────────────────────
-
-// OS start time of a process: a string if running, null if no such process,
-// undefined if the probe could not tell. Same probe as server.ts's
-// processStartTime (keep in sync: its output must match the lock file).
-function processStartTime(pid: number): string | null | undefined {
-  const [cmd, args]: [string, string[]] =
-    process.platform === "win32"
-      ? [
-          `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
-          ],
-        ]
-      : ["ps", ["-p", String(pid), "-o", "lstart="]];
-  try {
-    return (
-      execFileSync(cmd, args, {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5000,
-        windowsHide: true,
-      }).trim() || null
-    );
-  } catch (err) {
-    return process.platform !== "win32" &&
-      typeof (err as { status?: unknown }).status === "number"
-      ? null
-      : undefined;
-  }
-}
 
 // Parent PID, or null when unknown. Windows has no "reparented to PID 1"
 // notion, so the orphan check below is not implemented there; the server's
@@ -346,9 +314,8 @@ function checkServer(): void {
   } catch {
     /* fall through to malformed */
   }
-  const [pidLine = "", startLine = "", clientLine = ""] = raw.split("\n");
-  const pid = Number(pidLine.trim());
-  const lockedStart = startLine.trim();
+  const lock = parseLock(raw);
+  const pid = lock.pid;
   if (!Number.isFinite(pid) || pid <= 0) {
     report("WARN", "server", `lock file is malformed (${LOCK_FILE})`, {
       kind: "safe",
@@ -357,9 +324,10 @@ function checkServer(): void {
     return;
   }
   // Alive means: PID exists AND its start time matches what the lock
-  // recorded — the same PID-reuse guard as server.ts's acquireSingletonLock.
-  const currentStart = processStartTime(pid);
-  if (currentStart === undefined) {
+  // recorded — the same PID-reuse guard as server.ts's acquireSingletonLock,
+  // from the same shared code (lib/start-time.ts).
+  const holder = lockHolderState(lock);
+  if (holder === "unknown") {
     report(
       "WARN",
       "server",
@@ -367,9 +335,7 @@ function checkServer(): void {
     );
     return;
   }
-  const alive =
-    currentStart !== null && lockedStart !== "" && currentStart === lockedStart;
-  if (!alive) {
+  if (holder === "stale") {
     report(
       "WARN",
       "server",
@@ -394,7 +360,7 @@ function checkServer(): void {
   // Line 3 of the lock is the client that started the holder, so this can name
   // the owner instead of hedging. Absent on locks written before 0.15.0, and
   // on servers started by a client that does not identify itself.
-  const client = clientLine.trim();
+  const client = lock.client;
   const owner =
     client === ""
       ? " — started by a client that does not identify itself, or before 0.15.0"

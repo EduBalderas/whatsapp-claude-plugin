@@ -1,29 +1,17 @@
-import { execFileSync } from "node:child_process";
 import { createServer, type Socket } from "node:net";
 import { resolve } from "node:path";
 import { encode, IPC_HELLO_ID, ipcSocketPath, LineBuffer } from "./ipc";
+import { processLstart } from "../lib/start-time";
 
-// Same probe server.ts's acquireSingletonLock() uses, duplicated here exactly
-// as scripts/server-conflict.test.ts and scripts/doctor.test.ts already do -
-// this repo's established way of naming a live process (this test) as the
-// lock holder a spawned server.ts must treat as a real, unbeatable primary.
+// Lock line 2 for this test process, so a planted lock names it as the live
+// holder a spawned server.ts must treat as a real, unbeatable primary. The
+// rigs here write only lines 1-3, the pre-0.27.3 form; on Linux that is the
+// legacy path of acquireSingletonLock(), while scripts/server-conflict.test.ts
+// plants the current 4-line form.
 export function ownStartTime(): string {
-  const [cmd, args] =
-    process.platform === "win32"
-      ? [
-          `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `(Get-CimInstance Win32_Process -Filter "ProcessId=${process.pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
-          ],
-        ]
-      : ["ps", ["-p", String(process.pid), "-o", "lstart="]];
-  return execFileSync(cmd, args, {
-    encoding: "utf8",
-    windowsHide: true,
-  }).trim();
+  const start = processLstart(process.pid);
+  if (typeof start !== "string") throw new Error(`own lstart: ${start}`);
+  return start;
 }
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

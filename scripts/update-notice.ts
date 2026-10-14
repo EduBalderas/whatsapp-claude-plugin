@@ -57,6 +57,14 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.27.3",
+      notes: [
+        "Linux: the singleton lock no longer reads a live server as stale after a VM clock resync.",
+        "Linux: the lock file gains a 4th line for that; sessions still on 0.27.2 read it as before.",
+        "Linux: doctor judges the lock the same way and still understands older locks.",
+      ],
+    },
+    {
       version: "0.27.2",
       notes: [
         "Linux: a VM clock resync no longer makes the server think Claude exited and shut down.",
