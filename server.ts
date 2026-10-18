@@ -68,6 +68,7 @@ import { caseSafeKeys } from "./lib/auth-keys";
 import { cronMatches, parseCronSection } from "./lib/cron";
 import { extractMentions, extractText } from "./lib/inbound-message";
 import { parseMaxStore } from "./lib/max-store";
+import { fileMessage } from "./lib/outbound-media";
 import {
   formatLock,
   lockHolderState,
@@ -2910,9 +2911,7 @@ function pruneMessageLog(): void {
   }
 }
 
-// ─── Photo extensions ──────────────────────────────────────────────────
-
-const PHOTO_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
+// ─── Inbound media extensions ──────────────────────────────────────────
 
 function mimeToExt(mime: string | null | undefined): string {
   if (!mime) return "bin";
@@ -2929,31 +2928,6 @@ function mimeToExt(mime: string | null | undefined): string {
     "application/pdf": "pdf",
   };
   return map[mime.split(";")[0].trim()] ?? "bin";
-}
-
-// Declared mimetype for outbound documents. Android WhatsApp labels and opens an attachment by this
-// value, so "application/octet-stream" shows up as an unopenable "BIN" file.
-function mimeForExt(ext: string): string {
-  const m: Record<string, string> = {
-    ".pdf": "application/pdf",
-    ".md": "text/markdown",
-    ".txt": "text/plain",
-    ".csv": "text/csv",
-    ".json": "application/json",
-    ".html": "text/html",
-    ".zip": "application/zip",
-    ".docx":
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".xlsx":
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".pptx":
-      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ".mp3": "audio/mpeg",
-    ".m4a": "audio/mp4",
-    ".ogg": "audio/ogg",
-    ".wav": "audio/wav",
-  };
-  return m[ext.toLowerCase()] ?? "application/octet-stream";
 }
 
 // ─── MCP Server ────────────────────────────────────────────────────────
@@ -3323,7 +3297,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
               destructiveHint: false,
             },
             description:
-              "Reply on WhatsApp. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quoting, mentions (to @-tag people) and files (absolute paths) to attach images or documents.",
+              "Reply on WhatsApp. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quoting, mentions (to @-tag people) and files (absolute paths) to attach images, audio, voice notes or documents.",
             inputSchema: {
               type: "object",
               properties: {
@@ -3344,7 +3318,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
                   type: "array",
                   items: { type: "string" },
                   description:
-                    "Absolute file paths to attach. Images send as photos; other types as documents. Max 16MB each.",
+                    "Absolute file paths to attach. Images send as photos, videos as video, .mp3/.m4a as audio, and an Ogg Opus .ogg/.opus as a voice note (Cloud API: .ogg as plain audio); other types as documents. Max 16MB each.",
                 },
               },
               required: ["chat_id", "text"],
@@ -3828,40 +3802,10 @@ const handleToolCall = async (
 
         // Files as separate messages
         for (const f of files) {
-          const ext = extname(f).toLowerCase();
-          const buf = readFileSync(f);
-          let sent: WAMessage | undefined;
-          if (sock instanceof CloudApiSocket && ext === ".webp") {
-            sent = await sock.sendMessage(chat_id, { sticker: buf });
-          } else if (PHOTO_EXTS.has(ext)) {
-            sent = (await sock.sendMessage(chat_id, { image: buf })) as
-              WAMessage | undefined;
-          } else if ([".mp4", ".mov", ".avi"].includes(ext)) {
-            sent = (await sock.sendMessage(chat_id, {
-              video: buf,
-              ...(sock instanceof CloudApiSocket
-                ? { mimetype: "video/mp4" }
-                : {}),
-            })) as WAMessage | undefined;
-          } else if (
-            sock instanceof CloudApiSocket &&
-            [".mp3", ".ogg", ".m4a"].includes(ext)
-          ) {
-            sent = await sock.sendMessage(chat_id, {
-              audio: buf,
-              mimetype: mimeForExt(ext),
-            });
-          } else {
-            sent = (await sock.sendMessage(chat_id, {
-              document: buf,
-              fileName: basename(f),
-              mimetype:
-                sock instanceof CloudApiSocket &&
-                [".md", ".txt", ".csv", ".json", ".html"].includes(ext)
-                  ? "text/plain"
-                  : mimeForExt(ext),
-            })) as WAMessage | undefined;
-          }
+          const sent = (await sock.sendMessage(
+            chat_id,
+            fileMessage(f, readFileSync(f), PROVIDER),
+          )) as WAMessage | undefined;
           if (sent?.key) {
             trackSent(sent.key);
             if (sent.key.id) sentIds.push(sent.key.id);

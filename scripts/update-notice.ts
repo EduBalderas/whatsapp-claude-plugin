@@ -57,6 +57,13 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.28.0",
+      notes: [
+        "Linked device: an Ogg Opus .ogg/.opus sent with reply now arrives as a voice note.",
+        "Linked device: .mp3 and .m4a sent with reply now arrive as playable audio, not as a file.",
+      ],
+    },
+    {
       version: "0.27.3",
       notes: [
         "Linux: the singleton lock no longer reads a live server as stale after a VM clock resync.",
