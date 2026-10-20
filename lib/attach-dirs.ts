@@ -1,22 +1,27 @@
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 
 /**
- * Parse WHATSAPP_ATTACH_DIRS: a ":"-separated list of directories that
- * outbound attachments may come from. A leading "~" is the home directory.
- * Relative entries are dropped rather than resolved against whatever the
- * server's CWD happens to be, so the list means the same thing however the
- * server was launched. Unset or empty (after dropping bad entries) returns
- * [], which keeps the default behaviour: no directory allowlist.
+ * Parse WHATSAPP_ATTACH_DIRS: a list of directories that outbound
+ * attachments may come from, separated by the platform's path delimiter
+ * (":", or ";" on Windows so drive letters survive). A leading "~" is the
+ * home directory. Relative entries are dropped rather than resolved against
+ * whatever the server's CWD happens to be, so the list means the same thing
+ * however the server was launched. Unset or blank returns null: no directory
+ * allowlist, the default behaviour. A set value whose entries are all
+ * dropped returns [] so a typo fails closed (inbox only), not open.
  */
 export function parseAttachDirs(
   raw: string | undefined,
   home: string,
-): string[] {
-  if (!raw) return [];
+  separator: string = delimiter,
+): string[] | null {
+  const parts = (raw ?? "")
+    .split(separator)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return null;
   const dirs: string[] = [];
-  for (const part of raw.split(":")) {
-    const entry = part.trim();
-    if (!entry) continue;
+  for (const entry of parts) {
     const expanded =
       entry === "~"
         ? home

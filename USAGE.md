@@ -171,7 +171,7 @@ Outbound, `reply`'s `files` picks the message type from the extension: images se
 
 By default `reply` can attach any readable file except the channel's own state (credentials, logs) and a short blocklist (`~/.ssh`, `~/.aws`, `~/.gnupg`, files named `.env*`). That list is a speed bump: a secret stored anywhere else, under any other name, can still be sent, and a reply is only one prompt injection away from an allowlisted chat.
 
-To make it a real boundary, set `WHATSAPP_ATTACH_DIRS` in the server's `.env` to the directories attachments may come from, separated by `:`. A leading `~` is your home directory; relative entries are ignored.
+To make it a real boundary, set `WHATSAPP_ATTACH_DIRS` in the server's `.env` to the directories attachments may come from, separated by `:` (`;` on Windows, so `D:\share` keeps its drive letter). A leading `~` is your home directory; relative entries are ignored, and if none of the entries is usable only the inbox can be attached.
 
 ```bash
 # ~/.whatsapp-channel/.env
