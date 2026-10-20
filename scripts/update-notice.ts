@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.30.0",
+      notes: [
+        "New WHATSAPP_ATTACH_DIRS setting limits reply attachments to the listed directories (plus the inbox).",
+      ],
+    },
+    {
       version: "0.29.0",
       notes: [
         "Linked device: new send_poll tool sends a WhatsApp poll with 2 to 12 options.",
