@@ -173,6 +173,26 @@ describe("manualReadKey", () => {
     );
   });
 
+  test("an outbound DM id the store never kept is refused, not synthesized", () => {
+    expect(() => manualReadKey(DM, "OUT1", undefined, undefined, true)).toThrow(
+      /sent by this account/,
+    );
+  });
+
+  test("a sent group id is refused even with a sender on record", () => {
+    expect(() => manualReadKey(GROUP, "OUT2", undefined, SENDER, true)).toThrow(
+      /sent by this account/,
+    );
+  });
+
+  test("a DM id this server did not send still gets its key", () => {
+    expect(manualReadKey(DM, "DM9", undefined, undefined, false)).toEqual({
+      remoteJid: DM,
+      id: "DM9",
+      fromMe: false,
+    });
+  });
+
   test("missing ids and receipt-less chats are refused", () => {
     expect(() => manualReadKey(DM, "")).toThrow(/needs chat_id/);
     expect(() => manualReadKey("1234@newsletter", "N1")).toThrow(

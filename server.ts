@@ -5327,6 +5327,12 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
           },
         },
       })
+      .then(() => {
+        if (newReadKey && sock && !(sock instanceof CloudApiSocket))
+          sock.readMessages([newReadKey]).catch((err) => {
+            logDiag(`${LOG_PREFIX}: read receipt failed: ${err}\n`);
+          });
+      })
       .catch(() => {});
     return;
   }

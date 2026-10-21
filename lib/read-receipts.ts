@@ -81,7 +81,10 @@ export function loggedSender(
 
 /**
  * The key mark_read sends. `stored` is the key this process kept for that id
- * (lost on restart); `sender` is the fallback from loggedSender. Throws with
+ * (lost on restart); `sender` is the fallback from loggedSender; `sentByUs`
+ * is whether the durable sent-id log has the id (an outbound DM id is never
+ * in `stored`, so without it the synthesized key would pass as inbound).
+ * Throws with
  * the reason when no receipt can be built.
  */
 export function manualReadKey(
@@ -89,12 +92,13 @@ export function manualReadKey(
   messageId: string,
   stored?: WAMessageKey,
   sender?: string,
+  sentByUs = false,
 ): WAMessageKey {
   if (!chatId || !messageId)
     throw new Error("mark_read needs chat_id and message_id");
   if (stored && stored.remoteJid !== chatId && stored.remoteJidAlt !== chatId)
     throw new Error(`message ${messageId} is not in chat ${chatId}`);
-  if (stored?.fromMe)
+  if (stored?.fromMe || sentByUs)
     throw new Error(
       `message ${messageId} was sent by this account; only received messages can be marked read`,
     );
