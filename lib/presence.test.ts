@@ -157,6 +157,87 @@ describe("TypingIndicator", () => {
     ]);
   });
 
+  test("stop with a generation leaves an indicator a newer message started", () => {
+    const { clock, sent, typing } = harness();
+    typing.start(CHAT);
+    const mark = typing.generation();
+    // A new inbound lands while the older reply is still sending.
+    typing.start(CHAT);
+    typing.stop(CHAT, false, mark);
+    expect(typing.isActive(CHAT)).toBe(true);
+    clock.advance(8_000);
+    expect(sent.at(-1)).toEqual([CHAT, "composing"]);
+    // The reply to the newer message is not held back.
+    typing.stop(CHAT, false, typing.generation());
+    expect(typing.isActive(CHAT)).toBe(false);
+  });
+
+  test("stop with a generation still clears an indicator nothing restarted", () => {
+    const { sent, typing } = harness();
+    typing.start(CHAT);
+    typing.stop(CHAT, false, typing.generation());
+    expect(sent.at(-1)).toEqual([CHAT, "paused"]);
+  });
+
+  test("a voice note's recording stop leaves a newer inbound's typing up", () => {
+    const { sent, typing } = harness();
+    const rec = typing.set(CHAT, "recording");
+    typing.start(CHAT);
+    typing.stop(CHAT, true, rec);
+    expect(typing.isActive(CHAT)).toBe(true);
+    expect(sent).toEqual([
+      [CHAT, "recording"],
+      [CHAT, "composing"],
+    ]);
+  });
+
+  test("a LID mapping learned after start does not strand the loop", () => {
+    const lid = "222222222222222@lid";
+    const mapped = new Set<string>();
+    const { clock, sent, typing } = harness(30_000, (chat) =>
+      chat === lid && mapped.has(lid) ? CHAT : chat,
+    );
+    typing.start(lid);
+    mapped.add(lid);
+    // A reply addressed by the phone form finds the loop and cancels it.
+    typing.stop(CHAT);
+    expect(typing.isActive(lid)).toBe(false);
+    expect(clock.pending()).toBe(0);
+    clock.advance(60_000);
+    expect(sent).toEqual([
+      [lid, "composing"],
+      [lid, "paused"],
+    ]);
+  });
+
+  test("a LID mapping learned after start: the cap still ends the loop", () => {
+    const lid = "222222222222222@lid";
+    const mapped = new Set<string>();
+    const { clock, sent, typing } = harness(20_000, (chat) =>
+      chat === lid && mapped.has(lid) ? CHAT : chat,
+    );
+    typing.start(lid);
+    mapped.add(lid);
+    clock.advance(30_000);
+    expect(clock.pending()).toBe(0);
+    expect(sent.at(-1)).toEqual([lid, "paused"]);
+    expect(typing.isActive(lid)).toBe(false);
+  });
+
+  test("a message after the mapping joins the loop instead of adding one", () => {
+    const lid = "222222222222222@lid";
+    const mapped = new Set<string>();
+    const { clock, typing } = harness(60_000, (chat) =>
+      chat === lid && mapped.has(lid) ? CHAT : chat,
+    );
+    typing.start(lid);
+    mapped.add(lid);
+    typing.start(CHAT);
+    expect(clock.pending()).toBe(1);
+    typing.stop(lid);
+    expect(clock.pending()).toBe(0);
+  });
+
   test("with the cap at 0 a state is sent once and never refreshed", () => {
     const { clock, sent, typing } = harness(0);
     typing.start(CHAT);
@@ -164,6 +245,12 @@ describe("TypingIndicator", () => {
     expect(sent).toEqual([[CHAT, "composing"]]);
     expect(clock.pending()).toBe(0);
     expect(typing.isActive(CHAT)).toBe(false);
+  });
+
+  test("with the cap at 0 no timer is scheduled for any chat (Cloud API)", () => {
+    const { clock, typing } = harness(0);
+    for (let i = 0; i < 20; i++) typing.start(`1555000${i}@s.whatsapp.net`);
+    expect(clock.pending()).toBe(0);
   });
 });
 

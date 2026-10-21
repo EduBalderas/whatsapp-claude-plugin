@@ -276,6 +276,8 @@ const { ms: LOG_TTL_MS, note: TTL_NOTE } = resolveTtlMs(
 const { ms: TYPING_MAX_MS, note: TYPING_NOTE } = parseTypingMaxMinutes(
   process.env.WHATSAPP_TYPING_MAX_MINUTES,
 );
+// Cloud API has no typing indicator: no loop (no map entry, no interval).
+const TYPING_LOOP_MS = PROVIDER === "cloud-api" ? 0 : TYPING_MAX_MS;
 // import.meta.dir is this file's own directory, not CWD, so it's correct
 // regardless of where the process was launched from.
 const WIZARD_CMD = wizardCmd(import.meta.dir);
@@ -3039,7 +3041,8 @@ const typing = new TypingIndicator(
     },
     keyOf: (chat) => contactKey(chat),
   },
-  { refreshMs: TYPING_REFRESH_MS, maxMs: TYPING_MAX_MS },
+  // A cap of 0 schedules nothing: Cloud API cannot show it, so no timers.
+  { refreshMs: TYPING_REFRESH_MS, maxMs: TYPING_LOOP_MS },
 );
 
 const mcp = new Server(
@@ -3790,6 +3793,7 @@ const handleToolCall = async (
         // Taken before the first await in this handler, not after the send:
         // see markReplied. Anything that lands in this chat from here on is
         // NOT covered by this reply and must stay unreplied.
+        const typingMark = typing.generation();
         const repliedIds = new Set(
           getUnreplied()
             .filter((m) => m.chat_id === chat_id)
@@ -3976,13 +3980,13 @@ const handleToolCall = async (
           // "recording audio…" while a voice note uploads. Cleared in a
           // finally: a failed upload must not leave it up until the cap.
           const voiceNote = "ptt" in content && content.ptt === true;
-          if (voiceNote) typing.set(chat_id, "recording");
+          const recordingGen = voiceNote ? typing.set(chat_id, "recording") : 0;
           let sent: WAMessage | undefined;
           try {
             sent = (await sock.sendMessage(chat_id, content)) as
               WAMessage | undefined;
           } finally {
-            if (voiceNote) typing.stop(chat_id, true);
+            if (voiceNote) typing.stop(chat_id, true, recordingGen);
           }
           if (sent?.key) {
             trackSent(sent.key);
@@ -3991,8 +3995,9 @@ const handleToolCall = async (
         }
 
         markReplied(chat_id, repliedIds);
-        // Answered: take "typing…" down now rather than at the cap.
-        typing.stop(chat_id);
+        // Answered: take "typing…" down now rather than at the cap, unless a
+        // newer inbound message restarted it while this was sending.
+        typing.stop(chat_id, false, typingMark);
 
         // Log the outbound reply for catch_up — full original text once, not per chunk
         const outText =
@@ -4034,6 +4039,7 @@ const handleToolCall = async (
         if (!sock) throw new Error("WhatsApp not connected");
         // Snapshot before the await, same as `reply`: a poll answers what was
         // waiting when it was sent, not what lands while it is in flight.
+        const typingMark = typing.generation();
         const pollRepliedIds = new Set(
           getUnreplied()
             .filter((m) => m.chat_id === chat_id)
@@ -4067,7 +4073,7 @@ const handleToolCall = async (
         );
         savePolls();
         markReplied(chat_id, pollRepliedIds);
-        typing.stop(chat_id);
+        typing.stop(chat_id, false, typingMark);
         const pollGroupName = chat_id.endsWith("@g.us")
           ? await resolveGroupName(chat_id)
           : undefined;
@@ -5185,6 +5191,8 @@ async function handlePollVote(
       logDiag(`${LOG_PREFIX}: failed to deliver poll vote to Claude: ${err}\n`);
     });
   broadcastToSecondaries("notifications/claude/channel", notifyParams);
+  // A vote is a follow-up for the agent like any inbound message.
+  if (TYPING_LOOP_MS > 0) typing.start(chatJid);
 }
 
 async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
@@ -5378,14 +5386,6 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     }).catch(() => {});
   }
 
-  // Typing indicator, at once: downloading and transcribing a voice note can
-  // take a while. Kept up only once the message is handed over (see the end
-  // of this function): a reaction or protocol message from an allowed chat
-  // also reaches this line, and is never delivered or answered.
-  if (sock && !backlog) {
-    void sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
-  }
-
   // Media handling
   let imagePath: string | undefined;
   let attachment:
@@ -5399,6 +5399,18 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     | undefined;
 
   const media = classifyMedia(normalizedContent);
+
+  // Typing indicator, at once, and kept up from here: downloading and
+  // transcribing a voice note can take minutes, and WhatsApp clears a single
+  // update after ~10s. Only for content that will be delivered: a reaction or
+  // protocol message from an allowed chat also reaches this line, and is
+  // never delivered or answered (the check after media handling undoes it).
+  const typingWasUp = typing.isActive(remoteJid);
+  const typingRoutable = !backlog && !!(text || media);
+  if (sock && !backlog) {
+    if (typingRoutable && TYPING_LOOP_MS > 0) typing.start(remoteJid);
+    else void sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
+  }
   // BACKLOG MEDIA STILL RECORDS ITS KIND. The download is skipped for backlog
   // - that is what `!backlog` below is for, and it stays - but the kind is
   // metadata classifyMedia has already worked out, and withholding it made
@@ -5489,7 +5501,10 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   const contentText = neutralizeChannelTag(
     text || (media ? `(${media.kind})` : ""),
   );
-  if (!contentText && !imagePath && !attachment) return;
+  if (!contentText && !imagePath && !attachment) {
+    if (typingRoutable && !typingWasUp) typing.stop(remoteJid);
+    return;
+  }
 
   // Check for reply context
   const replyCtx = msg.message?.extendedTextMessage?.contextInfo;
@@ -5566,9 +5581,9 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       logDiag(`${LOG_PREFIX}: failed to deliver inbound to Claude: ${err}\n`);
     });
   broadcastToSecondaries("notifications/claude/channel", notifyParams);
-  // Handed to the agent: keep "typing…" up until it replies here (the reply
-  // tool stops it) or WHATSAPP_TYPING_MAX_MINUTES runs out.
-  if (TYPING_MAX_MS > 0) typing.start(remoteJid);
+  // Handed to the agent: "typing…" stays up (started before media handling)
+  // until it replies here (the reply tool stops it) or
+  // WHATSAPP_TYPING_MAX_MINUTES runs out.
 }
 
 // ─── Baileys connection with retry ─────────────────────────────────────

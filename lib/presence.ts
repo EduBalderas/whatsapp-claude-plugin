@@ -53,15 +53,21 @@ export interface PresenceDeps {
 }
 
 type Active = {
+  /** The key it is stored under: fixed when the loop starts, moved only by
+   *  find() when the chat's identity mapping changes. */
+  key: string;
   jid: string;
   state: "composing" | "recording";
   since: number;
+  /** Which start()/set() call last (re)started it; see generation(). */
+  gen: number;
   cancel: () => void;
 };
 
 export class TypingIndicator {
   private readonly active = new Map<string, Active>();
   private readonly keyOf: (chat: string) => string;
+  private seq = 0;
 
   constructor(
     private readonly deps: PresenceDeps,
@@ -70,39 +76,63 @@ export class TypingIndicator {
     this.keyOf = deps.keyOf ?? ((chat) => chat);
   }
 
+  /** A counter that grows with every start()/set(). Take it before a reply
+   *  goes out and pass it to stop(), so only the indicator that reply
+   *  answers is taken down, not one an inbound message started meanwhile. */
+  generation(): number {
+    return this.seq;
+  }
+
   /** An inbound message from this chat was handed to the agent. */
-  start(chat: string): void {
-    this.set(chat, "composing");
+  start(chat: string): number {
+    return this.set(chat, "composing");
   }
 
   /** Shows `state` in the chat and keeps it up until stop() or the cap. A
    *  repeat call switches the state and restarts the cap. With the cap at 0
-   *  the state is sent once and WhatsApp clears it by itself. */
-  set(chat: string, state: PresenceState): void {
-    if (state === "paused") return this.stop(chat, true);
+   *  the state is sent once and WhatsApp clears it by itself. Returns this
+   *  call's generation. */
+  set(chat: string, state: PresenceState): number {
+    if (state === "paused") {
+      this.stop(chat, true);
+      return this.seq;
+    }
+    const gen = ++this.seq;
     this.deps.send(chat, state);
-    if (this.opts.maxMs <= 0) return;
-    const key = this.keyOf(chat);
+    if (this.opts.maxMs <= 0) return gen;
     const now = this.deps.now();
-    const existing = this.active.get(key);
+    const existing = this.find(chat);
     if (existing) {
       existing.jid = chat;
       existing.state = state;
       existing.since = now;
-      return;
+      existing.gen = gen;
+      return gen;
     }
-    const cancel = this.deps.every(() => this.tick(key), this.opts.refreshMs);
-    this.active.set(key, { jid: chat, state, since: now, cancel });
+    const key = this.keyOf(chat);
+    const entry: Active = {
+      key,
+      jid: chat,
+      state,
+      since: now,
+      gen,
+      cancel: () => {},
+    };
+    entry.cancel = this.deps.every(() => this.tick(entry), this.opts.refreshMs);
+    this.active.set(key, entry);
+    return gen;
   }
 
   /** The agent answered this chat (or gave up): clear the indicator. Sends
-   *  "paused" only when one was up, unless `force` (a manual request). */
-  stop(chat: string, force = false): void {
-    const key = this.keyOf(chat);
-    const entry = this.active.get(key);
+   *  "paused" only when one was up, unless `force` (a manual request).
+   *  With `upTo` (a generation()/set() value taken before the answer), an
+   *  indicator restarted after that point is left up: it belongs to a newer
+   *  inbound message this answer does not cover. */
+  stop(chat: string, force = false, upTo?: number): void {
+    const entry = this.find(chat);
     if (entry) {
-      entry.cancel();
-      this.active.delete(key);
+      if (upTo !== undefined && entry.gen > upTo) return;
+      this.remove(entry);
       this.deps.send(entry.jid, "paused");
     } else if (force) {
       this.deps.send(chat, "paused");
@@ -110,14 +140,37 @@ export class TypingIndicator {
   }
 
   isActive(chat: string): boolean {
-    return this.active.has(this.keyOf(chat));
+    return this.find(chat) !== undefined;
   }
 
-  private tick(key: string): void {
-    const entry = this.active.get(key);
-    if (!entry) return;
+  /** The entry for this chat. keyOf can change for a chat that is already
+   *  up (an @lid learns its phone number), so a miss under the current key
+   *  also looks for an entry stored under the earlier one and moves it. */
+  private find(chat: string): Active | undefined {
+    const key = this.keyOf(chat);
+    const hit = this.active.get(key);
+    if (hit) return hit;
+    for (const entry of this.active.values()) {
+      if (entry.jid === chat || this.keyOf(entry.jid) === key) {
+        this.active.delete(entry.key);
+        entry.key = key;
+        this.active.set(key, entry);
+        return entry;
+      }
+    }
+    return undefined;
+  }
+
+  private remove(entry: Active): void {
+    entry.cancel();
+    if (this.active.get(entry.key) === entry) this.active.delete(entry.key);
+  }
+
+  private tick(entry: Active): void {
+    if (this.active.get(entry.key) !== entry) return;
     if (this.deps.now() - entry.since >= this.opts.maxMs) {
-      this.stop(entry.jid);
+      this.remove(entry);
+      this.deps.send(entry.jid, "paused");
       return;
     }
     this.deps.send(entry.jid, entry.state);
