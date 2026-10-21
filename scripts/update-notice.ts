@@ -57,6 +57,14 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.31.0",
+      notes: [
+        'Linked device: "typing…" now stays up while Claude works on a message, until it replies.',
+        "It stops after 10 minutes at most; set WHATSAPP_TYPING_MAX_MINUTES to change that (0 = off).",
+        'reply shows "recording audio…" while it uploads a voice note; set_presence sets either by hand.',
+      ],
+    },
+    {
       version: "0.30.0",
       notes: [
         "New WHATSAPP_ATTACH_DIRS setting limits reply attachments to the listed directories (plus the inbox).",
