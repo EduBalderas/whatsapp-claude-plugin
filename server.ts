@@ -4138,6 +4138,7 @@ const handleToolCall = async (
             messageId,
             stored,
             loggedSender(logText, chatId, messageId),
+            wasSentByServer(messageId),
           ),
         ]);
         return {
@@ -5297,6 +5298,13 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       });
     }
     // Notify Claude to reset context for this chat
+    const newReadKey = autoReadKey({
+      enabled: READ_RECEIPTS,
+      provider: PROVIDER,
+      gate: result.action,
+      backlog,
+      key: msg.key,
+    });
     mcp
       .notification({
         method: "notifications/claude/channel",
