@@ -167,6 +167,19 @@ Other media types (**voice notes, audio, video, documents, stickers**) are lazy 
 
 Outbound, `reply`'s `files` picks the message type from the extension: images send as photos, `.mp4`/`.mov`/`.avi` as video, `.mp3`/`.m4a` as audio, and anything else as a document. On linked device an `.ogg` or `.opus` file that contains Opus goes out as a **voice note** (push-to-talk, the green play button); an `.ogg` holding Vorbis stays a document, since WhatsApp voice notes have to be Opus. To turn other audio into a voice note: `ffmpeg -i in.wav -c:a libopus -b:a 32k -ac 1 note.ogg`. On Cloud API `.ogg` sends as plain audio, as before.
 
+### Restricting which files can be attached
+
+By default `reply` can attach any readable file except the channel's own state (credentials, logs) and a short blocklist (`~/.ssh`, `~/.aws`, `~/.gnupg`, files named `.env*`). That list is a speed bump: a secret stored anywhere else, under any other name, can still be sent, and a reply is only one prompt injection away from an allowlisted chat.
+
+To make it a real boundary, set `WHATSAPP_ATTACH_DIRS` in the server's `.env` to the directories attachments may come from, separated by `:` (`;` on Windows, so `D:\share` keeps its drive letter). A leading `~` is your home directory; relative entries are ignored, and if none of the entries is usable only the inbox can be attached.
+
+```bash
+# ~/.whatsapp-channel/.env
+WHATSAPP_ATTACH_DIRS=~/.whatsapp-channel/outbox:~/Pictures/share
+```
+
+With it set, only files received into `~/.whatsapp-channel/inbox/` or living under a listed directory can be attached; everything else is refused before it is read. The blocklist above still applies inside the listed directories. Unset or empty keeps the default behaviour.
+
 ## Polls
 
 `send_poll` sends a WhatsApp poll to an allowlisted chat (linked device only): a question and 2 to 12 options, single choice unless `multiple` is true. Every vote, change of vote or withdrawal comes back to the assistant as an ordinary inbound message, for example `[Poll vote] Akash voted: "Yes" on "Ship it?"` followed by the current tally, with `poll_id` and `option` in its meta. A vote goes through the same access gate as a message from that chat, minus the mention requirement (a vote on our own poll is addressed to us), and is listed by `catch_up` and `unreplied` like any other message.

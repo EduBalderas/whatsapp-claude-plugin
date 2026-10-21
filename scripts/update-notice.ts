@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.30.0",
+      notes: [
+        "New WHATSAPP_ATTACH_DIRS setting limits reply attachments to the listed directories (plus the inbox).",
+      ],
+    },
+    {
       version: "0.29.1",
       notes: [
         "Linked device: a DM poll vote arriving under a not-yet-mapped @lid is no longer dropped.",

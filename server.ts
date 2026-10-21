@@ -124,6 +124,7 @@ import {
   neutralizeChannelTag,
   safeName,
 } from "./lib/sanitize";
+import { isInsideAny, parseAttachDirs } from "./lib/attach-dirs";
 import { formatSentLine, parseSentLog } from "./lib/sent-log";
 import {
   contactName,
@@ -250,6 +251,12 @@ const ACCOUNT_NAME = process.env.WHATSAPP_ACCOUNT_NAME || "";
 // Opt out per-terminal with WHATSAPP_QUIET=1 - never a config file, so it
 // can't silently persist past the session that set it.
 const AUTO_NOTIFY = process.env.WHATSAPP_QUIET !== "1";
+// Opt-in directory allowlist for outbound attachments (see assertSendable).
+// Unset (null) keeps the default: any readable file outside the blocked paths.
+const ATTACH_DIRS =
+  parseAttachDirs(process.env.WHATSAPP_ATTACH_DIRS, homedir())?.map((dir) =>
+    realDir(dir),
+  ) ?? null;
 // How long any stored log line lives (why one horizon, and why it is capped:
 // resolveTtlMs in lib/message-view.ts). Read here, not in the lib, so the lib
 // stays pure. TTL_NOTE is logged at startup rather than here - logDiag's own
@@ -1255,6 +1262,17 @@ function assertSendable(f: string): void {
   const inbox = join(stateReal, "inbox");
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`);
+  }
+  // With WHATSAPP_ATTACH_DIRS set, this becomes a real boundary: only files
+  // received into inbox/ or living under a listed directory can go out.
+  if (
+    ATTACH_DIRS !== null &&
+    !real.startsWith(inbox + sep) &&
+    !isInsideAny(real, ATTACH_DIRS)
+  ) {
+    throw new Error(
+      `refusing to send a file outside WHATSAPP_ATTACH_DIRS: ${f}`,
+    );
   }
   const home = realDir(homedir());
   for (const d of SENSITIVE_HOME_DIRS) {
