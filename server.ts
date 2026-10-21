@@ -78,8 +78,10 @@ import {
   pollSpec,
   pollTally,
   POLL_TTL_MS,
+  prunePolls,
   recordVote,
   serializePollStore,
+  voteFromPollChat,
   voteText,
   type PollRecord,
 } from "./lib/polls";
@@ -4968,21 +4970,35 @@ async function handlePollVote(
   update: proto.Message.IPollUpdateMessage,
   backlog: boolean,
 ): Promise<void> {
+  // Aged out here as well as at load and on send_poll: a primary can stay up
+  // past a poll's 30 days with neither, and its votes must stop being read.
+  if (prunePolls(sentPolls, Date.now() - POLL_TTL_MS)) savePolls();
   const pollId = update.pollCreationMessageKey?.id;
   const poll = pollId ? sentPolls.get(pollId) : undefined;
   if (!pollId || !poll) return;
   if (!sock || sock instanceof CloudApiSocket) return;
   const chatJid = msg.key.remoteJid!;
-  // The vote must come from the chat the poll was sent to. contactKey maps a
-  // DM's @lid form to its phone form and leaves a group jid as it is.
-  if (contactKey(chatJid) !== contactKey(poll.chat_id)) return;
   const isGroup = chatJid.endsWith("@g.us");
   const fromMe = !!msg.key.fromMe;
+  // The vote must come from the chat the poll was sent to. In a DM the chat
+  // is the voter, resolved before the comparison as handleMessage resolves a
+  // sender before gate(). The owner's own vote uses the cached lid map only,
+  // logOwnerHandReply's rule.
+  if (
+    !(await voteFromPollChat(
+      poll,
+      chatJid,
+      contactKey,
+      fromMe ? undefined : ensureLidResolved,
+    ))
+  )
+    return;
   const voterJid = fromMe
     ? ownJid
     : jidNormalizedUser(isGroup ? (msg.key.participant ?? "") : chatJid);
   if (!voterJid) return;
-  if (!fromMe) await ensureLidResolved(voterJid);
+  // A DM's voter is its chat, already resolved above.
+  if (!fromMe && isGroup) await ensureLidResolved(voterJid);
   if (!pollVoteAllowed(chatJid, voterJid, fromMe)) return;
   // A replayed vote (same message id) was already counted and delivered.
   if (msg.key.id && messageAlreadyLogged(msg.key.id)) return;
@@ -5010,7 +5026,9 @@ async function handlePollVote(
     return;
   }
   const picked = pickedOptions(poll, opened.selected);
-  recordVote(poll, contactKey(voterJid), picked);
+  // Every form of the voter goes along: a pick kept under their raw @lid
+  // before it was mapped must not stay next to this one.
+  recordVote(poll, contactKey(voterJid), picked, voterForms);
   savePolls();
 
   const voterName = fromMe

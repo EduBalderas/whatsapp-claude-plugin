@@ -10,8 +10,10 @@ import {
   pickedOptions,
   pollSpec,
   pollTally,
+  prunePolls,
   recordVote,
   serializePollStore,
+  voteFromPollChat,
   voteText,
   type PollRecord,
 } from "./polls";
@@ -162,6 +164,66 @@ describe("poll store", () => {
     addPoll(store, poll({ id: "P6", ts: 60 }), 40);
     expect([...store.keys()].sort()).toEqual(["P5", "P6"]);
   });
+
+  test("prunePolls drops polls at or before the cutoff and says whether it did", () => {
+    const store = new Map([
+      ["OLD", poll({ id: "OLD", ts: 1000 })],
+      ["FRESH", poll({ id: "FRESH", ts: 1001 })],
+    ]);
+    expect(prunePolls(store, 1000)).toBe(true);
+    expect([...store.keys()]).toEqual(["FRESH"]);
+    expect(prunePolls(store, 1000)).toBe(false);
+    expect([...store.keys()]).toEqual(["FRESH"]);
+  });
+});
+
+describe("voteFromPollChat", () => {
+  // contactKey over a lid map the test controls.
+  const keyOver = (map: Record<string, string>) => (jid: string) =>
+    map[jid] ?? jid;
+
+  test("a DM vote under an unmapped @lid matches once resolve maps it", async () => {
+    const map: Record<string, string> = {};
+    const resolve = async (jid: string) => {
+      if (jid === VOTER_LID) map[jid] = VOTER;
+    };
+    expect(
+      await voteFromPollChat(
+        poll({ chat_id: VOTER }),
+        VOTER_LID,
+        keyOver(map),
+        resolve,
+      ),
+    ).toBe(true);
+  });
+
+  test("without resolve, only the cached map is used", async () => {
+    const p = poll({ chat_id: VOTER });
+    expect(await voteFromPollChat(p, VOTER_LID, keyOver({}))).toBe(false);
+    expect(
+      await voteFromPollChat(p, VOTER_LID, keyOver({ [VOTER_LID]: VOTER })),
+    ).toBe(true);
+  });
+
+  test("a vote from any other chat does not match", async () => {
+    const resolve = async () => {};
+    expect(
+      await voteFromPollChat(
+        poll(),
+        "120363000000000002@g.us",
+        keyOver({}),
+        resolve,
+      ),
+    ).toBe(false);
+    expect(
+      await voteFromPollChat(
+        poll({ chat_id: VOTER }),
+        ME,
+        keyOver({ [VOTER_LID]: VOTER }),
+        resolve,
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("pickedOptions and recordVote", () => {
@@ -183,6 +245,26 @@ describe("pickedOptions and recordVote", () => {
     recordVote(p, VOTER, ["No"]);
     expect(p.votes).toEqual({ [VOTER]: ["No"] });
     recordVote(p, VOTER, []);
+    expect(p.votes).toEqual({});
+  });
+
+  test("a pick kept under the voter's @lid is replaced, not counted twice", () => {
+    const p = poll();
+    // Accepted before the lid was mapped, so kept under the raw @lid.
+    recordVote(p, VOTER_LID, ["Yes"]);
+    recordVote(p, VOTER, ["No"], [VOTER, VOTER_LID]);
+    expect(p.votes).toEqual({ [VOTER]: ["No"] });
+    expect(pollTally(p)).toEqual([
+      { name: "Yes", count: 0 },
+      { name: "No", count: 1 },
+      { name: "Later", count: 0 },
+    ]);
+  });
+
+  test("a withdrawal clears the pick under every form of the voter", () => {
+    const p = poll();
+    recordVote(p, VOTER_LID, ["Yes"]);
+    recordVote(p, VOTER, [], [VOTER, VOTER_LID, null, undefined, ""]);
     expect(p.votes).toEqual({});
   });
 });

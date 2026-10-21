@@ -63,6 +63,14 @@ if (!isStaticMode()) {
       ],
     },
     {
+      version: "0.29.1",
+      notes: [
+        "Linked device: a DM poll vote arriving under a not-yet-mapped @lid is no longer dropped.",
+        "Linked device: a changed poll vote is no longer counted twice once the voter's @lid maps.",
+        "Linked device: votes on polls past 30 days are ignored even when the server never restarted.",
+      ],
+    },
+    {
       version: "0.29.0",
       notes: [
         "Linked device: new send_poll tool sends a WhatsApp poll with 2 to 12 options.",
