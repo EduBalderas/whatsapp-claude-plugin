@@ -142,10 +142,37 @@ export function addPoll(
   max = POLL_STORE_MAX,
 ): void {
   store.set(poll.id, poll);
-  for (const [id, p] of store) if (p.ts <= cutoffMs) store.delete(id);
+  prunePolls(store, cutoffMs);
   const byAge = [...store.values()].sort((a, b) => a.ts - b.ts);
   for (const p of byAge.slice(0, Math.max(0, byAge.length - max)))
     store.delete(p.id);
+}
+
+/** Drops every poll sent at or before `cutoffMs`. True if any was dropped, so
+ *  the caller knows polls.json needs writing. */
+export function prunePolls(
+  store: Map<string, PollRecord>,
+  cutoffMs: number,
+): boolean {
+  const before = store.size;
+  for (const [id, p] of store) if (p.ts <= cutoffMs) store.delete(id);
+  return store.size !== before;
+}
+
+/** Whether a vote came from the chat its poll was sent to, compared by `key`
+ *  (the server's contactKey: a DM's @lid form maps to its phone form, a group
+ *  jid stays as it is). A DM vote can arrive under an @lid nothing has mapped
+ *  yet although the poll went to the phone number, so `resolve` (the server's
+ *  ensureLidResolved) has to learn that mapping BEFORE the comparison. Left
+ *  out, only the cached map is used. */
+export async function voteFromPollChat(
+  poll: Pick<PollRecord, "chat_id">,
+  voteChat: string,
+  key: (jid: string) => string,
+  resolve?: (jid: string) => Promise<void>,
+): Promise<boolean> {
+  if (resolve) await resolve(voteChat);
+  return key(voteChat) === key(poll.chat_id);
 }
 
 /** How a vote names an option: SHA-256 of the option text. */
@@ -163,12 +190,17 @@ export function pickedOptions(
   return poll.options.filter((o) => hashes.has(optionHash(o).toString("hex")));
 }
 
-/** A voter's new pick replaces their old one; an empty pick withdraws it. */
+/** A voter's new pick replaces their old one; an empty pick withdraws it.
+ *  `aliases` are the voter's other jids: a pick kept under one of them (their
+ *  @lid, from before its phone number was known) is dropped first, so nobody
+ *  is counted twice and a withdrawal leaves nothing behind. */
 export function recordVote(
   poll: PollRecord,
   voter: string,
   picked: string[],
+  aliases: Array<string | null | undefined> = [],
 ): void {
+  for (const alias of aliases) if (alias) delete poll.votes[alias];
   if (picked.length) poll.votes[voter] = picked;
   else delete poll.votes[voter];
 }
