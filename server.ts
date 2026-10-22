@@ -86,6 +86,12 @@ import {
   type PollRecord,
 } from "./lib/polls";
 import {
+  autoReadKey,
+  loggedSender,
+  manualReadKey,
+  readReceiptsEnabled,
+} from "./lib/read-receipts";
+import {
   parseTypingMaxMinutes,
   TYPING_REFRESH_MS,
   TypingIndicator,
@@ -262,6 +268,10 @@ const ATTACH_DIRS =
   parseAttachDirs(process.env.WHATSAPP_ATTACH_DIRS, homedir())?.map((dir) =>
     realDir(dir),
   ) ?? null;
+// Default off: WHATSAPP_READ_RECEIPTS=1 marks each message read (blue ticks)
+// once it has been delivered to Claude. Linked device only; the rules for
+// which message and which key are in lib/read-receipts.ts.
+const READ_RECEIPTS = readReceiptsEnabled(process.env.WHATSAPP_READ_RECEIPTS);
 // How long any stored log line lives (why one horizon, and why it is capped:
 // resolveTtlMs in lib/message-view.ts). Read here, not in the lib, so the lib
 // stays pure. TTL_NOTE is logged at startup rather than here - logDiag's own
@@ -3557,6 +3567,24 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
             },
           },
           {
+            name: "mark_read",
+            annotations: {
+              title: "Mark WhatsApp message read",
+              readOnlyHint: false,
+              destructiveHint: false,
+            },
+            description:
+              "Mark a received WhatsApp message as read, which turns the sender's ticks blue. Pass chat_id and message_id from the inbound <channel> block. Not needed when WHATSAPP_READ_RECEIPTS=1, which marks every delivered message read already. If read receipts are off in the phone's privacy settings, the chat is marked read on this account only and the sender sees no blue ticks.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: { type: "string" },
+                message_id: { type: "string" },
+              },
+              required: ["chat_id", "message_id"],
+            },
+          },
+          {
             name: "status",
             annotations: {
               title: "WhatsApp connection status",
@@ -3661,9 +3689,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           .filter(
             (tool) =>
               PROVIDER !== "cloud-api" ||
-              !["edit_message", "list_groups", "group_roster"].includes(
-                tool.name,
-              ),
+              ![
+                "edit_message",
+                "mark_read",
+                "list_groups",
+                "group_roster",
+              ].includes(tool.name),
           )
           .map((tool) => {
             if (PROVIDER !== "cloud-api") return tool;
@@ -4189,6 +4220,36 @@ const handleToolCall = async (
         };
       }
 
+      case "mark_read": {
+        if (PROVIDER === "cloud-api")
+          throw new Error(
+            "read receipts are not supported with the Cloud API provider (linked device only)",
+          );
+        const chatId = args.chat_id as string;
+        const messageId = args.message_id as string;
+        assertAllowedChat(chatId);
+        if (!sock || sock instanceof CloudApiSocket)
+          throw new Error("WhatsApp not connected");
+        const stored = messageKeyStore.get(messageId);
+        let logText = "";
+        if (!stored)
+          try {
+            logText = readFileSync(MESSAGE_LOG, "utf8");
+          } catch {}
+        await sock.readMessages([
+          manualReadKey(
+            chatId,
+            messageId,
+            stored,
+            loggedSender(logText, chatId, messageId),
+            wasSentByServer(messageId),
+          ),
+        ]);
+        return {
+          content: [{ type: "text", text: `marked read (id: ${messageId})` }],
+        };
+      }
+
       case "status": {
         if (PROVIDER === "cloud-api") {
           const cloud = sock instanceof CloudApiSocket ? sock : undefined;
@@ -4202,7 +4263,7 @@ const handleToolCall = async (
             `DM policy: ${access.dmPolicy}`,
             `Allowed contacts: ${access.allowFrom.length}`,
             `Permission owner: ${permissionTarget(access) ? "configured" : "missing or revoked; set an allowlisted personal contact as owner"}`,
-            "Supported: DMs, replies, reactions, attachments, approved templates. Groups and message editing are unavailable in this mode.",
+            "Supported: DMs, replies, reactions, attachments, approved templates. Groups, message editing and read receipts are unavailable in this mode.",
             "Free-form replies require an open 24-hour service window. Meta fees and AI-provider rules apply.",
           ];
           return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -5343,6 +5404,13 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       });
     }
     // Notify Claude to reset context for this chat
+    const newReadKey = autoReadKey({
+      enabled: READ_RECEIPTS,
+      provider: PROVIDER,
+      gate: result.action,
+      backlog,
+      key: msg.key,
+    });
     mcp
       .notification({
         method: "notifications/claude/channel",
@@ -5364,6 +5432,12 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
               : {}),
           },
         },
+      })
+      .then(() => {
+        if (newReadKey && sock && !(sock instanceof CloudApiSocket))
+          sock.readMessages([newReadKey]).catch((err) => {
+            logDiag(`${LOG_PREFIX}: read receipt failed: ${err}\n`);
+          });
       })
       .catch(() => {});
     return;
@@ -5572,10 +5646,25 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       ...(replyToSender ? { reply_to_sender: safeName(replyToSender) } : {}),
     },
   };
+  // Blue ticks only once Claude has it: after the gate let it through and
+  // the notification went out. Backlog returned above, unmarked.
+  const readKey = autoReadKey({
+    enabled: READ_RECEIPTS,
+    provider: PROVIDER,
+    gate: result.action,
+    backlog,
+    key: msg.key,
+  });
   mcp
     .notification({
       method: "notifications/claude/channel",
       params: notifyParams,
+    })
+    .then(() => {
+      if (readKey && sock && !(sock instanceof CloudApiSocket))
+        sock.readMessages([readKey]).catch((err) => {
+          logDiag(`${LOG_PREFIX}: read receipt failed: ${err}\n`);
+        });
     })
     .catch((err) => {
       logDiag(`${LOG_PREFIX}: failed to deliver inbound to Claude: ${err}\n`);
